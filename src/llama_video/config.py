@@ -86,7 +86,7 @@ class ServerConfig(BaseSettings):
 
     url: str = Field(default="http://localhost:8080", description="llama-server URL")
     model_name: str = Field(default="", description="Model name for router mode (optional)")
-    timeout: float = Field(default=120.0, description="Request timeout in seconds")
+    timeout: float = Field(default=600.0, description="Request timeout in seconds")
     max_retries: int = Field(default=3, description="Max retry attempts")
     retry_delay: float = Field(default=1.0, description="Base retry delay in seconds")
 
