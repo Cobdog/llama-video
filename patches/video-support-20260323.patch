@@ -1,0 +1,442 @@
+diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
+index d5a6bad..611818b 100644
+--- a/tools/mtmd/mtmd-helper.cpp
++++ b/tools/mtmd/mtmd-helper.cpp
+@@ -303,14 +303,23 @@ int32_t mtmd_helper_decode_image_chunk(
+             const int nx = mtmd_image_tokens_get_nx(image_tokens);
+             const int ny = mtmd_image_tokens_get_ny(image_tokens);
+             const int nt = mtmd_image_tokens_get_nt(image_tokens);
+-            // Sequential temporal positions (0, 1, 2, ...)
+-            // Phase 3 will refine to pass actual M-RoPE temporal indices from Python
+-            std::vector<int32_t> temporal_positions(nt);
+-            for (int t = 0; t < nt; t++) {
+-                temporal_positions[t] = t;
++
++            // Use stored temporal positions if available, else fall back to sequential
++            size_t n_tp = 0;
++            const int32_t * stored_tp = mtmd_image_tokens_get_temporal_positions(
++                image_tokens, &n_tp);
++
++            std::vector<int32_t> fallback_tp;
++            const int32_t * tp = stored_tp;
++            if (!tp || n_tp == 0) {
++                fallback_tp.resize(nt);
++                for (int t = 0; t < nt; t++) {
++                    fallback_tp[t] = t;
++                }
++                tp = fallback_tp.data();
+             }
+-            batch_embd.set_position_mrope_3d(n_past, nx, ny, nt,
+-                                              temporal_positions.data(), seq_id);
++
++            batch_embd.set_position_mrope_3d(n_past, nx, ny, nt, tp, seq_id);
+         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+             batch_embd.set_position_mrope_1d(n_past, seq_id);
+         } else {
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 93a1cb5..5134148 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -37,6 +37,7 @@ struct mtmd_image_tokens {
+     uint32_t ny; // number of tokens in y direction
+     uint32_t nt = 1; // number of temporal positions (1 for images, >1 for video)
+     bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
++    std::vector<int32_t> temporal_positions; // M-RoPE temporal indices (one per temporal position)
+     uint32_t n_tokens() const { return nx * ny * nt; }
+     clip_image_f32_batch batch_f32; // preprocessed image patches
+     std::string id; // optional user-defined ID, useful for KV cache tracking
+@@ -47,6 +48,7 @@ struct mtmd_image_tokens {
+             ny,
+             nt,
+             use_mrope_pos,
++            temporal_positions,
+             batch_f32.clone(),
+             id
+         };
+@@ -810,6 +812,195 @@ struct mtmd_tokenizer {
+     }
+ };
+ 
++int32_t mtmd_tokenize_video(mtmd_context * ctx,
++            mtmd_input_chunks * output,
++            const mtmd_input_text * text,
++            const mtmd_bitmap ** bitmaps,
++            size_t n_bitmaps,
++            const int32_t * temporal_positions,
++            size_t n_temporal_positions) {
++    if (!ctx->ctx_v) {
++        LOG_ERR("%s: model does not support vision input\n", __func__);
++        return 1;
++    }
++    if (n_bitmaps < 2) {
++        LOG_ERR("%s: video requires at least 2 frames, got %zu\n", __func__, n_bitmaps);
++        return 1;
++    }
++
++    const size_t n_superframes = n_bitmaps / 2; // drop last frame if odd
++    if (n_temporal_positions != n_superframes) {
++        LOG_ERR("%s: temporal_positions count (%zu) must equal n_bitmaps/2 (%zu)\n",
++                __func__, n_temporal_positions, n_superframes);
++        return 1;
++    }
++
++    // Split text at media marker
++    std::string input_text = text->text;
++    // convert legacy image marker to media marker
++    string_replace_all(input_text, MTMD_DEFAULT_IMAGE_MARKER, ctx->media_marker);
++
++    auto parts = mtmd_tokenizer::split_text(input_text, ctx->media_marker);
++    size_t n_markers = 0;
++    for (auto & p : parts) {
++        if (p == ctx->media_marker) n_markers++;
++    }
++    if (n_markers != 1) {
++        LOG_ERR("%s: video expects exactly 1 media marker, got %zu\n", __func__, n_markers);
++        return 1;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(ctx->text_model);
++
++    // Preprocess frame pairs into super-frames
++    clip_image_f32_batch video_batch;
++    video_batch.is_video = true;
++
++    for (size_t i = 0; i < n_superframes; i++) {
++        const mtmd_bitmap * bm_a = bitmaps[i * 2];
++        const mtmd_bitmap * bm_b = bitmaps[i * 2 + 1];
++
++        // Convert bitmaps to clip_image_u8
++        clip_image_u8_ptr img_a(clip_image_u8_init());
++        img_a->nx = bm_a->nx;
++        img_a->ny = bm_a->ny;
++        img_a->buf.resize(bm_a->data.size());
++        std::memcpy(img_a->buf.data(), bm_a->data.data(), bm_a->data.size());
++
++        clip_image_u8_ptr img_b(clip_image_u8_init());
++        img_b->nx = bm_b->nx;
++        img_b->ny = bm_b->ny;
++        img_b->buf.resize(bm_b->data.size());
++        std::memcpy(img_b->buf.data(), bm_b->data.data(), bm_b->data.size());
++
++        // Preprocess each frame (resize + normalize)
++        clip_image_f32_batch batch_a, batch_b;
++        if (!clip_image_preprocess(ctx->ctx_v, img_a.get(), &batch_a)) {
++            LOG_ERR("%s: failed to preprocess frame %zu\n", __func__, i * 2);
++            return 2;
++        }
++        if (!clip_image_preprocess(ctx->ctx_v, img_b.get(), &batch_b)) {
++            LOG_ERR("%s: failed to preprocess frame %zu\n", __func__, i * 2 + 1);
++            return 2;
++        }
++
++        // Both frames should have been resized to the same dimensions
++        auto & f32_a = batch_a.entries[0];
++        auto & f32_b = batch_b.entries[0];
++        GGML_ASSERT(f32_a->nx == f32_b->nx && f32_a->ny == f32_b->ny);
++
++        const int nx = f32_a->nx;
++        const int ny = f32_a->ny;
++        const int n_pixels = nx * ny;
++
++        // Merge two 3-channel HWC images into one 6-channel HWC super-frame
++        clip_image_f32_ptr super_frame(clip_image_f32_init());
++        super_frame->nx = nx;
++        super_frame->ny = ny;
++        super_frame->buf.resize(n_pixels * 6);
++
++        for (int p = 0; p < n_pixels; p++) {
++            super_frame->buf[p * 6 + 0] = f32_a->buf[p * 3 + 0];
++            super_frame->buf[p * 6 + 1] = f32_a->buf[p * 3 + 1];
++            super_frame->buf[p * 6 + 2] = f32_a->buf[p * 3 + 2];
++            super_frame->buf[p * 6 + 3] = f32_b->buf[p * 3 + 0];
++            super_frame->buf[p * 6 + 4] = f32_b->buf[p * 3 + 1];
++            super_frame->buf[p * 6 + 5] = f32_b->buf[p * 3 + 2];
++        }
++
++        video_batch.entries.push_back(std::move(super_frame));
++    }
++
++    // Create video image_tokens
++    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
++    image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, video_batch.entries[0].get());
++    image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, video_batch.entries[0].get());
++    image_tokens->nt = n_superframes;
++    image_tokens->use_mrope_pos = true;
++    image_tokens->temporal_positions.assign(temporal_positions,
++                                             temporal_positions + n_temporal_positions);
++    image_tokens->batch_f32 = std::move(video_batch);
++    image_tokens->id = "video";
++
++    LOG_DBG("%s: video nx=%d ny=%d nt=%d n_tokens=%d\n", __func__,
++            image_tokens->nx, image_tokens->ny, image_tokens->nt,
++            image_tokens->n_tokens());
++
++    // Build output chunks: text + VIDEO + text
++    mtmd_input_chunks result;
++
++    auto add_text_chunk = [&](const std::vector<llama_token> & tokens) {
++        if (tokens.empty()) return;
++        if (!result.entries.empty()
++            && result.entries.back().type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
++            auto & back = result.entries.back().tokens_text;
++            back.insert(back.end(), tokens.begin(), tokens.end());
++        } else {
++            result.entries.push_back({
++                MTMD_INPUT_CHUNK_TYPE_TEXT,
++                tokens,
++                nullptr,
++                nullptr,
++            });
++        }
++    };
++
++    for (auto & part : parts) {
++        if (part == ctx->media_marker) {
++            // Add vision begin token
++            if (!ctx->img_beg.empty()) {
++                auto tokens = mtmd_tokenizer::mtmd_tokenize_text_internal(
++                    vocab, ctx->img_beg, false, true);
++                add_text_chunk(tokens);
++            }
++
++            // Add VIDEO chunk
++            result.entries.push_back({
++                MTMD_INPUT_CHUNK_TYPE_VIDEO,
++                {},
++                std::move(image_tokens),
++                nullptr,
++            });
++
++            // Add vision end token
++            if (!ctx->img_end.empty()) {
++                auto tokens = mtmd_tokenizer::mtmd_tokenize_text_internal(
++                    vocab, ctx->img_end, false, true);
++                add_text_chunk(tokens);
++            }
++        } else {
++            auto tokens = mtmd_tokenizer::mtmd_tokenize_text_internal(
++                vocab, part, false, text->parse_special);
++            add_text_chunk(tokens);
++        }
++    }
++
++    // Handle BOS
++    if (text->add_special && llama_vocab_get_add_bos(vocab)) {
++        if (!result.entries.empty()
++            && result.entries[0].type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
++            result.entries[0].tokens_text.insert(
++                result.entries[0].tokens_text.begin(), llama_vocab_bos(vocab));
++        } else {
++            mtmd_input_chunk bos_chunk{
++                MTMD_INPUT_CHUNK_TYPE_TEXT,
++                {llama_vocab_bos(vocab)},
++                nullptr,
++                nullptr,
++            };
++            result.entries.insert(result.entries.begin(), std::move(bos_chunk));
++        }
++    }
++
++    // Handle EOS
++    if (text->add_special && llama_vocab_get_add_eos(vocab)) {
++        add_text_chunk({llama_vocab_eos(vocab)});
++    }
++
++    *output = std::move(result);
++    return 0;
++}
++
+ int32_t mtmd_tokenize(mtmd_context * ctx,
+             mtmd_input_chunks * output,
+             const mtmd_input_text * text,
+@@ -1129,6 +1320,17 @@ size_t mtmd_image_tokens_get_nt(const mtmd_image_tokens * image_tokens) {
+     return image_tokens->nt;
+ }
+ 
++const int32_t * mtmd_image_tokens_get_temporal_positions(
++        const mtmd_image_tokens * image_tokens,
++        size_t * n_positions) {
++    if (image_tokens->temporal_positions.empty()) {
++        *n_positions = 0;
++        return nullptr;
++    }
++    *n_positions = image_tokens->temporal_positions.size();
++    return image_tokens->temporal_positions.data();
++}
++
+ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
+     return image_tokens->id.c_str();
+ }
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+index a394224..144ae90 100644
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -189,10 +189,32 @@ MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * i
+ MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
+ MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
+ MTMD_API size_t       mtmd_image_tokens_get_nt      (const mtmd_image_tokens * image_tokens); // temporal positions (1 for images, >1 for video)
++// get temporal positions array for video chunks (nullptr for images)
++// n_positions will be set to the number of temporal positions
++MTMD_API const int32_t * mtmd_image_tokens_get_temporal_positions(
++    const mtmd_image_tokens * image_tokens,
++    size_t * n_positions);
+ MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
+ // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
+ MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
+ 
++// tokenize a video prompt: pairs consecutive bitmaps into 6-channel super-frames
++// and creates a single VIDEO chunk with temporal position encoding
++// n_bitmaps must be >= 2; odd counts drop the last frame
++// n_temporal_positions must equal n_bitmaps / 2
++// the prompt must have exactly one media marker
++// return values:
++//   0 on success
++//   1 on input validation error
++//   2 on preprocessing error
++MTMD_API int32_t mtmd_tokenize_video(mtmd_context * ctx,
++                                      mtmd_input_chunks * output,
++                                      const mtmd_input_text * text,
++                                      const mtmd_bitmap ** bitmaps,
++                                      size_t n_bitmaps,
++                                      const int32_t * temporal_positions,
++                                      size_t n_temporal_positions);
++
+ // tokenize an input text prompt and a list of bitmaps (images/audio)
+ // the prompt must have the input image marker (default: "<__media__>") in it
+ // the default marker is defined by mtmd_default_marker()
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index e01c8c5..bdf5988 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -341,7 +341,7 @@ void server_tokens::push_back(llama_token tok) {
+ 
+ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
+     auto type = mtmd_input_chunk_get_type(chunk);
+-    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
++    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO || type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+         GGML_ASSERT(has_mtmd);
+         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+         size_t start_idx = tokens.size();
+@@ -517,8 +517,10 @@ int32_t server_tokens::process_chunk(
+             int32_t seq_id,
+             size_t & n_tokens_out) const {
+     const auto & chunk = find_chunk(idx);
+-    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+-                        ? "image" : "audio";
++    auto media_type = mtmd_input_chunk_get_type(chunk.get());
++    const char * name = media_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image"
++                      : media_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video"
++                      : "audio";
+     SRV_INF("processing %s...\n", name);
+     int32_t n_batch = llama_n_batch(ctx);
+     int64_t t0 = ggml_time_ms();
+@@ -691,7 +693,7 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
+     return std::to_string(hash);
+ }
+ 
+-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
++server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files, const json & mm_kwargs) {
+     mtmd::bitmaps bitmaps;
+     for (auto & file : files) {
+         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+@@ -713,13 +715,54 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
+     };
+     mtmd::input_chunks chunks(mtmd_input_chunks_init());
+     auto bitmaps_c_ptr = bitmaps.c_ptr();
+-    int32_t tokenized = mtmd_tokenize(mctx,
+-                                      chunks.ptr.get(),
+-                                      &inp_txt,
+-                                      bitmaps_c_ptr.data(),
+-                                      bitmaps_c_ptr.size());
+-    if (tokenized != 0) {
+-        throw std::runtime_error("Failed to tokenize prompt");
++
++    // Detect video mode
++    bool is_video = json_value(mm_kwargs, "is_video", false);
++
++    if (is_video) {
++        // In video mode, multiple image_url entries each created a media marker.
++        // Collapse all markers into a single one for mtmd_tokenize_video.
++        std::string marker = mtmd_default_marker();
++        size_t first_pos = prompt.find(marker);
++        if (first_pos != std::string::npos) {
++            size_t pos = first_pos + marker.size();
++            while ((pos = prompt.find(marker, pos)) != std::string::npos) {
++                prompt.erase(pos, marker.size());
++            }
++        }
++
++        // Extract temporal positions
++        auto tp_json = json_value(mm_kwargs, "temporal_positions", json::array());
++        std::vector<int32_t> temporal_positions;
++        for (auto & tp : tp_json) {
++            temporal_positions.push_back(tp.get<int32_t>());
++        }
++
++        // Re-create input text with collapsed prompt
++        mtmd_input_text inp_txt_video = {
++            prompt.c_str(),
++            /* add_special */   true,
++            /* parse_special */ true,
++        };
++        int32_t tokenized = mtmd_tokenize_video(mctx,
++                                                 chunks.ptr.get(),
++                                                 &inp_txt_video,
++                                                 bitmaps_c_ptr.data(),
++                                                 bitmaps_c_ptr.size(),
++                                                 temporal_positions.data(),
++                                                 temporal_positions.size());
++        if (tokenized != 0) {
++            throw std::runtime_error("Failed to tokenize video prompt");
++        }
++    } else {
++        int32_t tokenized = mtmd_tokenize(mctx,
++                                           chunks.ptr.get(),
++                                           &inp_txt,
++                                           bitmaps_c_ptr.data(),
++                                           bitmaps_c_ptr.size());
++        if (tokenized != 0) {
++            throw std::runtime_error("Failed to tokenize prompt");
++        }
+     }
+     auto result = server_tokens(chunks, true);
+     return result;
+@@ -1129,6 +1172,11 @@ json oaicompat_chat_params_parse(
+         throw std::invalid_argument("top_logprobs requires logprobs to be set to true");
+     }
+ 
++    // Pass through multimodal processor kwargs (used for video mode)
++    if (body.contains("mm_processor_kwargs")) {
++        llama_params["mm_processor_kwargs"] = body.at("mm_processor_kwargs");
++    }
++
+     // Copy remaining properties to llama_params
+     // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
+     // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 213ae52..e73f444 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -251,7 +251,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
+ size_t validate_utf8(const std::string& text);
+ 
+ // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
+-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
++server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files, const json & mm_kwargs = json::object());
+ 
+ /**
+  * break the input "prompt" object into multiple prompt if needed, then tokenize them
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b79a527..d4d16e0 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3066,7 +3066,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+ 
+         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
++            json mm_kwargs = json_value(data, "mm_processor_kwargs", json::object());
++            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, mm_kwargs));
+         } else {
+             // Everything else, including multimodal completions.
+             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);

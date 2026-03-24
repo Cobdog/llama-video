@@ -1,0 +1,61 @@
+# llama.cpp clone (has its own git)
+llama.cpp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+
+# uv
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (large, user-provided)
+models/
+
+# Test data (large files)
+tests/data/*.mp4
+tests/data/*.mkv
+tests/data/*.avi
+
+# Test videos (large files, not committed)
+testvid/
+
+# Internal dev docs (kept locally, not published)
+CLAUDE.md
+docs/planning/
+docs/DOC_HYGIENE.md
+docs/STYLE_GUIDE.md
+scripts/hf_reference.py
+
+# Debug output
+/tmp/
