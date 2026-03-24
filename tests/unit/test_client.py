@@ -306,7 +306,8 @@ class TestImageCaptioning:
 
         body = json.loads(route.calls[0].request.content)
         assert "mm_processor_kwargs" not in body
-        assert body["messages"][0]["content"][0]["type"] == "image_url"
+        assert body["messages"][0]["role"] == "system"
+        assert body["messages"][1]["content"][0]["type"] == "image_url"
         assert result == "A sunset."
 
 

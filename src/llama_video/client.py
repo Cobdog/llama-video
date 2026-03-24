@@ -30,6 +30,16 @@ logger = logging.getLogger(__name__)
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _THINK_OPEN = "<think>"
 
+_SYSTEM_MESSAGE: dict[str, str] = {
+    "role": "system",
+    "content": (
+        "You are a media captioning assistant. Your reasoning is private and "
+        "will not be shown to the user. Your response must contain the complete, "
+        "detailed caption — do not summarize or abbreviate what you described "
+        "in your reasoning. Write the full description in your response."
+    ),
+}
+
 
 def parse_model_response(text: str) -> tuple[str, str, bool]:
     """Parse thinking tags from a model response.
@@ -224,7 +234,7 @@ class LlamaServerClient:
         message = self._build_video_message(video_input, prompt)
 
         payload: dict[str, Any] = {
-            "messages": [message],
+            "messages": [_SYSTEM_MESSAGE, message],
             "max_tokens": max_tokens,
             "temperature": effective_temp,
             "top_p": preset.top_p,
@@ -344,7 +354,7 @@ class LlamaServerClient:
         client = await self._get_client()
 
         payload: dict[str, Any] = {
-            "messages": [message],
+            "messages": [_SYSTEM_MESSAGE, message],
             "max_tokens": max_tokens,
             "temperature": effective_temp,
             "top_p": preset.top_p,
@@ -492,7 +502,7 @@ class LlamaServerClient:
         message = self._build_video_message(video_input, prompt)
 
         payload: dict[str, Any] = {
-            "messages": [message],
+            "messages": [_SYSTEM_MESSAGE, message],
             "max_tokens": max_tokens,
             "temperature": effective_temp,
             "top_p": preset.top_p,
@@ -551,7 +561,7 @@ class LlamaServerClient:
         message = build_image_message(image_path, prompt)
 
         payload: dict[str, Any] = {
-            "messages": [message],
+            "messages": [_SYSTEM_MESSAGE, message],
             "max_tokens": max_tokens,
             "temperature": effective_temp,
             "top_p": preset.top_p,
