@@ -6,6 +6,7 @@ users understand context window consumption before running inference.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -34,10 +35,34 @@ class TokenEstimator:
         spatial_patch_size: int = 14,
         merge_size: int = 2,
         temporal_patch_size: int = 2,
+        min_pixels: int = 3136,
+        max_pixels: int = 12845056,
     ) -> None:
         self._spatial_patch = spatial_patch_size
         self._merge = merge_size
         self._temporal_patch = temporal_patch_size
+        self._min_pixels = min_pixels
+        self._max_pixels = max_pixels
+
+    def _smart_resize(self, width: int, height: int) -> tuple[int, int]:
+        """Mirror preprocessor's _compute_target_resolution."""
+        grid_unit = self._spatial_patch * self._merge
+
+        total = width * height
+        if total > self._max_pixels:
+            scale = math.sqrt(self._max_pixels / total)
+            width = int(width * scale)
+            height = int(height * scale)
+
+        total = width * height
+        if total < self._min_pixels:
+            scale = math.sqrt(self._min_pixels / total)
+            width = int(width * scale)
+            height = int(height * scale)
+
+        target_w = max(grid_unit, round(width / grid_unit) * grid_unit)
+        target_h = max(grid_unit, round(height / grid_unit) * grid_unit)
+        return target_w, target_h
 
     def estimate(
         self,
@@ -64,16 +89,17 @@ class TokenEstimator:
         max_tokens: int = 2048,
         context_limit: int = 65536,
     ) -> TokenBudget:
-        """Estimate token budget from raw parameters (approximate).
+        """Estimate token budget from raw parameters.
 
-        Used for pre-inference UI display before frames are extracted.
+        Mirrors the preprocessor's smart resize and grid computation
+        so the UI budget bar matches actual inference token counts.
         """
         width, height = resolution
         grid_unit = self._spatial_patch * self._merge
 
-        # Approximate grid dimensions (matches preprocessor logic)
-        h_grid = height // grid_unit
-        w_grid = width // grid_unit
+        target_w, target_h = self._smart_resize(width, height)
+        h_grid = target_h // grid_unit
+        w_grid = target_w // grid_unit
         t_grid = max(1, frame_count // self._temporal_patch)
 
         vision_tokens = t_grid * h_grid * w_grid
