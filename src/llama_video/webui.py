@@ -873,6 +873,11 @@ def _build_caption_tab(
             mode = detect_mode(fp)
             rs = _RESOLUTION_MAP.get(res_name, 1.0)
             mf = _dur_to_frames(dur, fps)
+            logger.info(
+                "Caption: fps=%.1f, dur=%.1f, res=%s (scale=%.3f), "
+                "frames=%d, max_tokens=%s, stream=%s",
+                fps, dur, res_name, rs, mf, mt, do_stream,
+            )
 
             def _warn_html(truncated: bool):
                 if truncated:
