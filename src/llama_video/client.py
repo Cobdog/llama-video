@@ -428,10 +428,11 @@ class LlamaServerClient:
     async def _iter_sse_tokens(
         self,
         payload: dict[str, Any],
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[tuple[str, bool], None]:
         """Stream SSE tokens from /v1/chat/completions.
 
-        Yields individual token strings as they arrive.
+        Yields (token, is_reasoning) tuples. The server puts thinking tokens
+        in ``delta.reasoning_content`` and caption tokens in ``delta.content``.
         """
         client = await self._get_client()
         async with client.stream(
@@ -468,14 +469,17 @@ class LlamaServerClient:
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
-                token = delta.get("content", "") or ""
-                if not token:
-                    token = delta.get("reasoning_content", "") or ""
-                if token_count == 0 and token:
+                # Check both fields, preserving which one the token came from
+                content = delta.get("content", "") or ""
+                reasoning = delta.get("reasoning_content", "") or ""
+                if token_count == 0 and (content or reasoning):
                     logger.info("SSE: first token received, delta keys=%s", list(delta.keys()))
-                if token:
+                if content:
                     token_count += 1
-                    yield token
+                    yield content, False
+                elif reasoning:
+                    token_count += 1
+                    yield reasoning, True
 
             logger.info("SSE: stream complete, %d tokens received", token_count)
 
@@ -529,15 +533,17 @@ class LlamaServerClient:
             cache_prompt,
         )
 
-        raw = ""
-        async for token in self._iter_sse_tokens(payload):
-            raw += token
-            thinking, caption, still_thinking = _parse_stream_state(raw)
-            yield thinking, caption, still_thinking
+        thinking = ""
+        caption = ""
+        async for token, is_reasoning in self._iter_sse_tokens(payload):
+            if is_reasoning:
+                thinking += token
+            else:
+                caption += token
+            yield thinking, caption, is_reasoning
 
-        caption, thinking, truncated = parse_model_response(raw)
         self.last_thinking = thinking
-        self.last_truncated = truncated
+        self.last_truncated = not caption and bool(thinking)
 
     async def stream_caption_image(
         self,
@@ -577,15 +583,17 @@ class LlamaServerClient:
 
         logger.info("Streaming image to llama-server: %s (cache=%s)", image_path, cache_prompt)
 
-        raw = ""
-        async for token in self._iter_sse_tokens(payload):
-            raw += token
-            thinking, caption, still_thinking = _parse_stream_state(raw)
-            yield thinking, caption, still_thinking
+        thinking = ""
+        caption = ""
+        async for token, is_reasoning in self._iter_sse_tokens(payload):
+            if is_reasoning:
+                thinking += token
+            else:
+                caption += token
+            yield thinking, caption, is_reasoning
 
-        caption, thinking, truncated = parse_model_response(raw)
         self.last_thinking = thinking
-        self.last_truncated = truncated
+        self.last_truncated = not caption and bool(thinking)
 
     async def health_check(self) -> bool:
         """Check if llama-server is reachable and healthy."""
