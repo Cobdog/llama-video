@@ -481,6 +481,7 @@ def create_app() -> gr.Blocks:
 
     with gr.Blocks(
         title="llama-video",
+        analytics_enabled=False,
     ) as app:
         gr.Markdown(
             "# llama-video\n"
