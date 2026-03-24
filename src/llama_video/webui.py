@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -1488,7 +1489,7 @@ def _build_history_tab() -> None:
             try:
                 txt = hist.export(format=fmt)
                 ext = "json" if fmt == "json" else "csv"
-                p = Path(f"/tmp/llama-video-export.{ext}")
+                p = Path(tempfile.gettempdir()) / f"llama-video-export.{ext}"
                 p.write_text(txt)
                 return gr.update(
                     visible=True,

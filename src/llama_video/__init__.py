@@ -55,4 +55,4 @@ __all__ = [
     "validate_batch_mode",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

@@ -36,6 +36,9 @@ You need two files per model: a **GGUF model** and a **mmproj** (vision projecto
 
 ```bash
 pip install llama-video
+
+# With Gradio WebUI:
+pip install "llama-video[ui]"
 ```
 
 Or from source:
@@ -43,9 +46,6 @@ Or from source:
 ```bash
 git clone https://github.com/Cobdog/llama-video.git
 cd llama-video
-pip install .
-
-# With Gradio UI:
 pip install ".[ui]"
 ```
 
@@ -69,10 +69,18 @@ git apply /path/to/llama-video/patches/video-support-20260323.patch
 
 #### Interactive build (recommended)
 
-The included build script prompts for GPU backend, build type, and parallel job count:
+If you installed from source, the included build script prompts for GPU backend, build type, and parallel job count:
 
 ```bash
 ./scripts/build.sh ./llama.cpp
+```
+
+If you installed via pip, grab the script directly:
+
+```bash
+curl -O https://raw.githubusercontent.com/Cobdog/llama-video/main/scripts/build.sh
+chmod +x build.sh
+./build.sh ./llama.cpp
 ```
 
 It supports CUDA, HIP (AMD), Vulkan, Metal (macOS), and CPU-only. It will auto-detect `nvcc` in common locations (`/opt/cuda/bin`, `/usr/local/cuda/bin`) if it's not already on your PATH.
@@ -275,7 +283,7 @@ The WebUI shows a live token budget bar so you can tune before running inference
 - **ffmpeg must be on PATH.** The library calls ffmpeg as a subprocess. On Windows, either add it to PATH or set `LLAMA_VIDEO_FFMPEG_PATH` to the full path.
 - **Thinking mode is verbose.** Qwen3.5 with `default` preset uses thinking mode, which produces internal reasoning before the final caption. This is normal — the library extracts the final answer automatically. Set timeout accordingly (120s+ for longer videos).
 - **No audio processing.** Only visual frames are extracted. Audio tracks are ignored.
-- **Super-frame pairing.** Frames are paired sequentially (frame 0+1, 2+3, ...). An odd number of frames drops the last frame by default. Extracting an even number of frames avoids waste.
+- **Super-frame pairing.** Frames are paired sequentially (frame 0+1, 2+3, ...). An odd number of frames duplicates the last frame to form a complete pair. Extracting an even number of frames avoids this.
 
 ### Windows-Specific Notes
 
@@ -292,17 +300,21 @@ llama-video/
 │   ├── extractor.py       # ffmpeg frame extraction
 │   ├── preprocessor.py    # Super-frame construction + grid THW
 │   ├── client.py          # llama-server HTTP client
-│   ├── server.py          # FastAPI service
+│   ├── server.py          # FastAPI captioning service
 │   ├── webui.py           # Gradio experimentation UI
 │   ├── config.py          # Settings and presets
 │   ├── templates.py       # Prompt templates
 │   ├── tokens.py          # Token budget estimation
 │   ├── history.py         # SQLite caption history
-│   └── batch.py           # Batch captioning
+│   ├── batch.py           # Batch captioning
+│   ├── image.py           # Single-image captioning
+│   ├── patch_cli.py       # llama-video-patch CLI
+│   ├── debug_cli.py       # llama-video-debug CLI
+│   ├── errors.py          # Exception hierarchy
+│   └── types.py           # Core data types (Frame, SuperFrame, etc.)
 ├── patches/               # C patches for llama.cpp
 ├── scripts/               # Setup, build, and run scripts
-├── tests/                 # Unit, integration, and smoke tests
-└── docs/                  # Design docs and references
+└── tests/                 # Unit, integration, and smoke tests
 ```
 
 ## License

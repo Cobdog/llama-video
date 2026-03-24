@@ -9,11 +9,22 @@ from pathlib import Path
 
 def find_patches() -> list[Path]:
     """Find patch files shipped with the package."""
-    patches_dir = Path(__file__).parent.parent.parent / "patches"
-    if patches_dir.is_dir():
-        return sorted(patches_dir.glob("*.patch"))
-    # Fallback: check if running from installed package
-    # Patches may be in the package data
+    pkg_dir = Path(__file__).parent
+
+    # Pip install: patches bundled inside the package via force-include
+    bundled = pkg_dir / "patches"
+    if bundled.is_dir():
+        patches = sorted(bundled.glob("*.patch"))
+        if patches:
+            return patches
+
+    # Source checkout: patches/ at the project root
+    source = pkg_dir.parent.parent / "patches"
+    if source.is_dir():
+        patches = sorted(source.glob("*.patch"))
+        if patches:
+            return patches
+
     return []
 
 

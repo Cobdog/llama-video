@@ -1,6 +1,6 @@
 [project]
 name = "llama-video"
-version = "0.1.0"
+version = "0.1.1"
 description = "Temporal video support for llama.cpp — frame extraction, preprocessing, and captioning service for Qwen3.5 GGUF models"
 readme = "README.md"
 license = {text = "MIT"}
@@ -60,6 +60,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/llama_video"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"patches" = "llama_video/patches"
+"scripts/build.sh" = "llama_video/scripts/build.sh"
 
 [tool.hatch.build.targets.sdist]
 include = ["src/", "patches/", "scripts/", "README.md", "LICENSE"]
