@@ -896,7 +896,7 @@ def _build_caption_tab(
                 fps, dur, res_name, rs, mf, mt, do_stream, use_cache,
             )
 
-            def _warn_html(truncated: bool):
+            def _warn_html(truncated: bool) -> dict[str, Any]:
                 if truncated:
                     return gr.update(
                         visible=True,

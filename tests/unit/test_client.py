@@ -365,6 +365,6 @@ class TestParseStreamState:
 
     def test_partial_close_tag(self):
         # </thin is not </think> — still inside thinking
-        thinking, caption, still = _parse_stream_state("<think>reasoning</thin")
+        thinking, _caption, still = _parse_stream_state("<think>reasoning</thin")
         assert "reasoning" in thinking
         assert still is True
