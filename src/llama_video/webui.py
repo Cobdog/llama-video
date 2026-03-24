@@ -724,7 +724,9 @@ def _build_caption_tab(
 
             if is_vid:
                 info = await _probe_video(fp)
-                vid_dur = float(info.get("duration", 0))
+                raw_dur = float(info.get("duration", 0))
+                # Snap up to next 0.5s step so the slider covers the full video
+                vid_dur = math.ceil(raw_dur * 2) / 2  # e.g. 5.098 → 5.5
                 if vid_dur > 0:
                     fc = _dur_to_frames(vid_dur, fps)
                     dur_update = gr.update(
