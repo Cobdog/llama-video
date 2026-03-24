@@ -230,6 +230,7 @@ class LlamaServerClient:
             "top_k": preset.top_k,
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
+            "cache_prompt": False,
             # Video metadata for the C patch
             "mm_processor_kwargs": {
                 "fps": video_input.fps,
@@ -347,6 +348,7 @@ class LlamaServerClient:
             "top_k": preset.top_k,
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
+            "cache_prompt": False,
         }
 
         if self._config.model_name:
@@ -494,6 +496,7 @@ class LlamaServerClient:
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
             "stream": True,
+            "cache_prompt": False,
             "mm_processor_kwargs": {
                 "fps": video_input.fps,
                 "is_video": True,
@@ -550,6 +553,7 @@ class LlamaServerClient:
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
             "stream": True,
+            "cache_prompt": False,
         }
 
         if self._config.model_name:
