@@ -225,6 +225,7 @@ curl -X POST http://localhost:9000/v1/caption \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLAMA_SERVER_URL` | `http://localhost:8080` | llama-server base URL |
+| `LLAMA_SERVER_MODEL_NAME` | *(empty)* | Model name for router mode (optional) |
 | `LLAMA_SERVER_TIMEOUT` | `120` | Request timeout in seconds |
 | `LLAMA_VIDEO_DEFAULT_FPS` | `2.0` | Frame extraction rate |
 | `LLAMA_VIDEO_MAX_FRAMES` | `64` | Max frames to extract per video |
