@@ -351,9 +351,7 @@ class TestParseStreamState:
         assert still is True
 
     def test_think_tag_closed(self):
-        thinking, caption, still = _parse_stream_state(
-            "<think>done thinking</think>The caption"
-        )
+        thinking, caption, still = _parse_stream_state("<think>done thinking</think>The caption")
         assert thinking == "done thinking"
         assert caption == "The caption"
         assert still is False

@@ -417,10 +417,7 @@ async def _check_health(url: str, timeout: float) -> str:
         async with _httpx.AsyncClient(base_url=url, timeout=short_timeout) as c:
             resp = await c.get("/health")
             if resp.status_code != 200:
-                return (
-                    '<span style="color:#ffaa00;font-weight:bold">'
-                    "\u25cf Degraded</span>"
-                )
+                return '<span style="color:#ffaa00;font-weight:bold">\u25cf Degraded</span>'
 
             # Server is up — query loaded model
             model_name = ""
@@ -436,14 +433,10 @@ async def _check_health(url: str, timeout: float) -> str:
             status = '<span style="color:#50c878;font-weight:bold">\u25cf Connected</span>'
             if model_name:
                 status += (
-                    f'<br><span style="color:#aaa;font-size:12px">'
-                    f"Model: <b>{model_name}</b></span>"
+                    f'<br><span style="color:#aaa;font-size:12px">Model: <b>{model_name}</b></span>'
                 )
             else:
-                status += (
-                    '<br><span style="color:#888;font-size:12px">'
-                    "No model loaded</span>"
-                )
+                status += '<br><span style="color:#888;font-size:12px">No model loaded</span>'
             return status
     except (_httpx.ConnectError, _httpx.TimeoutException):
         return '<span style="color:#ff4444;font-weight:bold">\u25cf Unreachable</span>'
@@ -740,25 +733,26 @@ def _build_caption_tab(
                 if vid_dur > 0:
                     fc = _dur_to_frames(vid_dur, fps)
                     dur_update = gr.update(
-                        maximum=vid_dur, value=vid_dur, interactive=True,
+                        maximum=vid_dur,
+                        value=vid_dur,
+                        interactive=True,
                     )
-                    txt = (
-                        f"Video: {info['width']}"
-                        f"\u00d7{info['height']}, "
-                        f"{vid_dur:.1f}s"
-                    )
+                    txt = f"Video: {info['width']}\u00d7{info['height']}, {vid_dur:.1f}s"
                 else:
                     # Duration unknown — don't cap the slider
                     vid_dur = 30.0
                     fc = _dur_to_frames(vid_dur, fps)
                     dur_update = gr.update(interactive=True)
-                    txt = (
-                        f"Video: {info['width']}"
-                        f"\u00d7{info['height']}"
-                    )
+                    txt = f"Video: {info['width']}\u00d7{info['height']}"
                 gal = await _extract_preview(fp, fps, fc)
                 bgt = compute_budget(
-                    info, fps, vid_dur, prompt, int(mt), ctx_i, rs,
+                    info,
+                    fps,
+                    vid_dur,
+                    prompt,
+                    int(mt),
+                    ctx_i,
+                    rs,
                 )
                 fc_txt = f"{fc} frames @ {fps} fps"
             else:
@@ -772,7 +766,13 @@ def _build_caption_tab(
                 }
                 gal = [(img, f"Image ({iw}\u00d7{ih})")]
                 bgt = compute_budget(
-                    info, 1, 1, prompt, int(mt), ctx_i, rs,
+                    info,
+                    1,
+                    1,
+                    prompt,
+                    int(mt),
+                    ctx_i,
+                    rs,
                 )
                 txt = f"Image: {iw}\u00d7{ih}"
                 dur_update = gr.update(interactive=False)
@@ -893,7 +893,14 @@ def _build_caption_tab(
             logger.info(
                 "Caption: fps=%.1f, dur=%.1f, res=%s (scale=%.3f), "
                 "frames=%d, max_tokens=%s, stream=%s, cache=%s",
-                fps, dur, res_name, rs, mf, mt, do_stream, use_cache,
+                fps,
+                dur,
+                res_name,
+                rs,
+                mf,
+                mt,
+                do_stream,
+                use_cache,
             )
 
             def _warn_html(truncated: bool) -> dict[str, Any]:
@@ -913,8 +920,20 @@ def _build_caption_tab(
             if not do_stream:
                 try:
                     cap, thinking, meta, truncated, res = await _do_caption(
-                        fp, mode, prompt, fps, mf, int(mt),
-                        temp, tp, int(tk), mp, pp, url, tout, rs,
+                        fp,
+                        mode,
+                        prompt,
+                        fps,
+                        mf,
+                        int(mt),
+                        temp,
+                        tp,
+                        int(tk),
+                        mp,
+                        pp,
+                        url,
+                        tout,
+                        rs,
                         use_cache,
                     )
                 except LlamaVideoError as e:
@@ -943,14 +962,18 @@ def _build_caption_tab(
                     ext = Extractor()
                     pre = Preprocessor()
                     frames = await ext.extract_frames_async(
-                        fp, ExtractorConfig(fps=fps, max_frames=mf),
+                        fp,
+                        ExtractorConfig(fps=fps, max_frames=mf),
                     )
                     vi = pre.process(frames, fps=fps, resolution_scale=rs)
 
                     final_thinking = ""
                     final_caption = ""
                     async for thinking, caption, _ in client.stream_caption_video(
-                        vi, prompt=prompt, max_tokens=int(mt), preset=preset,
+                        vi,
+                        prompt=prompt,
+                        max_tokens=int(mt),
+                        preset=preset,
                         cache_prompt=use_cache,
                     ):
                         final_thinking = thinking
@@ -959,8 +982,12 @@ def _build_caption_tab(
 
                     ms = (time.monotonic() - start) * 1000
                     meta = build_metadata_html(
-                        "video", len(frames), len(vi.super_frames),
-                        vi.grid_thw, vi.resolution, ms,
+                        "video",
+                        len(frames),
+                        len(vi.super_frames),
+                        vi.grid_thw,
+                        vi.resolution,
+                        ms,
                     )
                     res = CaptionResult(
                         caption=final_caption,
@@ -984,7 +1011,10 @@ def _build_caption_tab(
                     final_thinking = ""
                     final_caption = ""
                     async for thinking, caption, _ in client.stream_caption_image(
-                        fp, prompt=prompt, max_tokens=int(mt), preset=preset,
+                        fp,
+                        prompt=prompt,
+                        max_tokens=int(mt),
+                        preset=preset,
                         cache_prompt=use_cache,
                     ):
                         final_thinking = thinking
@@ -1000,7 +1030,12 @@ def _build_caption_tab(
                     th = max(gu, round(ih / gu) * gu)
                     hg, wg = th // gu, tw // gu
                     meta = build_metadata_html(
-                        "image", 1, 0, (1, hg, wg), (tw, th), ms,
+                        "image",
+                        1,
+                        0,
+                        (1, hg, wg),
+                        (tw, th),
+                        ms,
                     )
                     res = CaptionResult(
                         caption=final_caption,
@@ -1022,7 +1057,13 @@ def _build_caption_tab(
                     )
 
                 _save_result(res)
-                yield final_caption, final_thinking, meta, _warn_html(client.last_truncated), cur_visual
+                yield (
+                    final_caption,
+                    final_thinking,
+                    meta,
+                    _warn_html(client.last_truncated),
+                    cur_visual,
+                )
 
             except LlamaVideoError as e:
                 raise gr.Error(str(e)) from e
