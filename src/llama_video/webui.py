@@ -724,19 +724,29 @@ def _build_caption_tab(
 
             if is_vid:
                 info = await _probe_video(fp)
-                vid_dur = float(info.get("duration", 0)) or 30.0
-                fc = _dur_to_frames(vid_dur, fps)
+                vid_dur = float(info.get("duration", 0))
+                if vid_dur > 0:
+                    fc = _dur_to_frames(vid_dur, fps)
+                    dur_update = gr.update(
+                        maximum=vid_dur, value=vid_dur, interactive=True,
+                    )
+                    txt = (
+                        f"Video: {info['width']}"
+                        f"\u00d7{info['height']}, "
+                        f"{vid_dur:.1f}s"
+                    )
+                else:
+                    # Duration unknown — don't cap the slider
+                    vid_dur = 30.0
+                    fc = _dur_to_frames(vid_dur, fps)
+                    dur_update = gr.update(interactive=True)
+                    txt = (
+                        f"Video: {info['width']}"
+                        f"\u00d7{info['height']}"
+                    )
                 gal = await _extract_preview(fp, fps, fc)
                 bgt = compute_budget(
                     info, fps, vid_dur, prompt, int(mt), ctx_i, rs,
-                )
-                txt = (
-                    f"Video: {info['width']}"
-                    f"\u00d7{info['height']}, "
-                    f"{vid_dur:.1f}s"
-                )
-                dur_update = gr.update(
-                    maximum=vid_dur, value=vid_dur, interactive=True,
                 )
                 fc_txt = f"{fc} frames @ {fps} fps"
             else:

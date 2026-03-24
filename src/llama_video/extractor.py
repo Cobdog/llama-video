@@ -124,6 +124,13 @@ class Extractor:
                         duration = float(fields[2])
                 except ValueError:
                     continue
+            elif len(fields) == 1 and duration == 0.0:
+                # Format duration on its own line (fallback when
+                # stream duration is N/A or missing)
+                try:
+                    duration = float(fields[0])
+                except ValueError:
+                    continue
         return width, height, duration
 
     async def extract_frames_async(
