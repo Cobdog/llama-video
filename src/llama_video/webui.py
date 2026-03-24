@@ -152,10 +152,15 @@ _RESOLUTION_NAMES = [name for name, _ in _RESOLUTION_SCALES]
 _RESOLUTION_MAP = dict(_RESOLUTION_SCALES)
 
 
+def _dur_to_frames(caption_dur: float, fps: float) -> int:
+    """Convert caption duration + FPS to frame count."""
+    return max(2, math.ceil(caption_dur * fps))
+
+
 def compute_budget(
     info: dict[str, Any],
     fps: float,
-    max_frames: int,
+    caption_dur: float,
     prompt: str,
     max_tokens: int,
     context_limit: int,
@@ -170,8 +175,7 @@ def compute_budget(
     h = max(1, int(int(info["height"]) * resolution_scale))
 
     if mode == "video":
-        dur = float(info.get("duration", 0))
-        fc = min(max_frames, max(1, math.ceil(dur * fps))) if dur > 0 else max_frames
+        fc = _dur_to_frames(caption_dur, fps)
     else:
         fc = 1
         fps = 1.0
@@ -241,8 +245,11 @@ async def _do_caption(
     server_url: str,
     timeout: float,
     resolution_scale: float = 1.0,
-) -> tuple[str, str, CaptionResult]:
-    """Full pipeline: extract, preprocess, infer, return."""
+) -> tuple[str, str, str, bool, CaptionResult]:
+    """Full pipeline: extract, preprocess, infer, return.
+
+    Returns (caption, thinking, metadata_html, truncated, CaptionResult).
+    """
     cfg = ServerConfig(url=server_url, timeout=timeout)
     client = LlamaServerClient(cfg)
     preset = InferencePreset(
@@ -289,7 +296,7 @@ async def _caption_video(
     client: LlamaServerClient,
     start: float,
     resolution_scale: float = 1.0,
-) -> tuple[str, str, CaptionResult]:
+) -> tuple[str, str, str, bool, CaptionResult]:
     """Video captioning sub-pipeline."""
     ext = Extractor()
     pre = Preprocessor()
@@ -304,6 +311,8 @@ async def _caption_video(
         max_tokens=max_tokens,
         preset=preset,
     )
+    thinking = client.last_thinking
+    truncated = client.last_truncated
     ms = (time.monotonic() - start) * 1000
     meta = build_metadata_html(
         "video",
@@ -335,7 +344,7 @@ async def _caption_video(
         token_usage=None,
         duration_ms=ms,
     )
-    return cap, meta, res
+    return cap, thinking, meta, truncated, res
 
 
 async def _caption_image(
@@ -345,7 +354,7 @@ async def _caption_image(
     preset: InferencePreset,
     client: LlamaServerClient,
     start: float,
-) -> tuple[str, str, CaptionResult]:
+) -> tuple[str, str, str, bool, CaptionResult]:
     """Image captioning sub-pipeline."""
     cap = await client.caption_image(
         path,
@@ -353,6 +362,8 @@ async def _caption_image(
         max_tokens=max_tokens,
         preset=preset,
     )
+    thinking = client.last_thinking
+    truncated = client.last_truncated
     ms = (time.monotonic() - start) * 1000
     img = load_image(path)
     ih, iw = img.shape[:2]
@@ -387,7 +398,7 @@ async def _caption_image(
         token_usage=None,
         duration_ms=ms,
     )
-    return cap, meta, res
+    return cap, thinking, meta, truncated, res
 
 
 async def _check_health(url: str, timeout: float) -> str:
@@ -548,17 +559,31 @@ def _build_caption_tab(
                     value="Describe what happens in this video.",
                     lines=3,
                 )
-                c_btn = gr.Button(
-                    "Caption",
-                    variant="primary",
-                    size="lg",
-                )
+                with gr.Row():
+                    c_btn = gr.Button(
+                        "Caption",
+                        variant="primary",
+                        size="lg",
+                    )
+                    c_cancel = gr.Button(
+                        "Cancel",
+                        variant="stop",
+                        size="lg",
+                    )
+                c_warn = gr.HTML(visible=False)
                 c_out = gr.Textbox(
                     label="Caption Output",
                     lines=10,
                     interactive=False,
                     buttons=["copy"],
                 )
+                with gr.Accordion("Reasoning", open=False):
+                    c_think = gr.Textbox(
+                        label="Model Reasoning",
+                        lines=8,
+                        interactive=False,
+                        buttons=["copy"],
+                    )
                 with gr.Accordion("Metadata", open=False):
                     c_meta = gr.HTML()
 
@@ -571,12 +596,18 @@ def _build_caption_tab(
                     step=0.5,
                     label="FPS",
                 )
-                c_mf = gr.Slider(
-                    2,
-                    256,
-                    value=64,
-                    step=2,
-                    label="Max Frames",
+                c_dur = gr.Slider(
+                    0.5,
+                    300,
+                    value=30,
+                    step=0.5,
+                    label="Duration (s)",
+                )
+                c_fc = gr.Textbox(
+                    label="Frames",
+                    value="",
+                    interactive=False,
+                    max_lines=1,
                 )
                 c_res = gr.Dropdown(
                     label="Resolution",
@@ -625,6 +656,11 @@ def _build_caption_tab(
                         step=0.1,
                         label="Presence Penalty",
                     )
+                c_stream = gr.Checkbox(
+                    label="Stream output",
+                    value=True,
+                    info="Show tokens as they arrive",
+                )
                 gr.Markdown("### Generation")
                 c_mt = gr.Slider(
                     64,
@@ -666,7 +702,7 @@ def _build_caption_tab(
 
         # ── Events ──
 
-        async def _on_upload(fp, fps, mf, mt, ctx, prompt, res_name):
+        async def _on_upload(fp, fps, mt, ctx, prompt, res_name):
             if fp is None:
                 return (
                     None,
@@ -675,6 +711,7 @@ def _build_caption_tab(
                     {},
                     gr.update(),
                     gr.update(),
+                    "",
                 )
             try:
                 mode = detect_mode(fp)
@@ -687,28 +724,21 @@ def _build_caption_tab(
 
             if is_vid:
                 info = await _probe_video(fp)
-                gal = await _extract_preview(
-                    fp,
-                    fps,
-                    int(mf),
-                )
+                vid_dur = float(info.get("duration", 0)) or 30.0
+                fc = _dur_to_frames(vid_dur, fps)
+                gal = await _extract_preview(fp, fps, fc)
                 bgt = compute_budget(
-                    info,
-                    fps,
-                    int(mf),
-                    prompt,
-                    int(mt),
-                    ctx_i,
-                    rs,
+                    info, fps, vid_dur, prompt, int(mt), ctx_i, rs,
                 )
-                n = len(gal)
-                dur = info.get("duration", 0)
                 txt = (
                     f"Video: {info['width']}"
                     f"\u00d7{info['height']}, "
-                    f"{dur:.1f}s, {n} frames "
-                    f"@ {fps} fps"
+                    f"{vid_dur:.1f}s"
                 )
+                dur_update = gr.update(
+                    maximum=vid_dur, value=vid_dur, interactive=True,
+                )
+                fc_txt = f"{fc} frames @ {fps} fps"
             else:
                 img = load_image(fp)
                 ih, iw = img.shape[:2]
@@ -718,19 +748,13 @@ def _build_caption_tab(
                     "duration": 0,
                     "mode": "image",
                 }
-                gal = [
-                    (img, f"Image ({iw}\u00d7{ih})"),
-                ]
+                gal = [(img, f"Image ({iw}\u00d7{ih})")]
                 bgt = compute_budget(
-                    info,
-                    1,
-                    1,
-                    prompt,
-                    int(mt),
-                    ctx_i,
-                    rs,
+                    info, 1, 1, prompt, int(mt), ctx_i, rs,
                 )
                 txt = f"Image: {iw}\u00d7{ih}"
+                dur_update = gr.update(interactive=False)
+                fc_txt = ""
 
             return (
                 gal,
@@ -738,7 +762,8 @@ def _build_caption_tab(
                 txt,
                 info,
                 gr.update(interactive=is_vid),
-                gr.update(interactive=is_vid),
+                dur_update,
+                fc_txt,
             )
 
         c_file.change(
@@ -746,7 +771,6 @@ def _build_caption_tab(
             inputs=[
                 c_file,
                 c_fps,
-                c_mf,
                 c_mt,
                 c_ctx,
                 c_prompt,
@@ -758,56 +782,49 @@ def _build_caption_tab(
                 c_mode,
                 vi_state,
                 c_fps,
-                c_mf,
+                c_dur,
+                c_fc,
             ],
         )
 
-        # Live budget updates
-        def _bgt(vi, fps, mf, prompt, mt, ctx, res_name):
+        # Live budget + frame count updates
+        def _bgt(vi, fps, dur, prompt, mt, ctx, res_name):
             rs = _RESOLUTION_MAP.get(res_name, 1.0)
-            return compute_budget(
-                vi,
-                fps,
-                int(mf),
-                prompt,
-                int(mt),
-                int(ctx),
-                rs,
-            )
+            budget = compute_budget(vi, fps, dur, prompt, int(mt), int(ctx), rs)
+            fc = _dur_to_frames(dur, fps) if vi.get("mode") == "video" else 0
+            fc_txt = f"{fc} frames @ {fps} fps" if fc else ""
+            return budget, fc_txt
 
         bgt_in = [
             vi_state,
             c_fps,
-            c_mf,
+            c_dur,
             c_prompt,
             c_mt,
             c_ctx,
             c_res,
         ]
-        for _c in [c_fps, c_mf, c_mt, c_ctx, c_res]:
+        for _c in [c_fps, c_dur, c_mt, c_ctx, c_res]:
             _c.change(
                 fn=_bgt,
                 inputs=bgt_in,
-                outputs=[c_budget],
+                outputs=[c_budget, c_fc],
             )
 
         # Re-extract preview on video settings change
-        async def _prev(fp, fps, mf):
+        async def _prev(fp, fps, dur):
             if not fp:
                 return None
             try:
-                return await _extract_preview(
-                    fp,
-                    fps,
-                    int(mf),
-                )
+                fc = _dur_to_frames(dur, fps)
+                return await _extract_preview(fp, fps, fc)
             except Exception:
                 return None
 
-        for _c in [c_fps, c_mf]:
+        for _c in [c_fps, c_dur]:
             _c.change(
                 fn=_prev,
-                inputs=[c_file, c_fps, c_mf],
+                inputs=[c_file, c_fps, c_dur],
                 outputs=[c_gallery],
             )
 
@@ -822,12 +839,12 @@ def _build_caption_tab(
             outputs=[c_temp, c_tp, c_tk, c_mp, c_pp],
         )
 
-        # Caption button
+        # Caption button (async generator for streaming support)
         async def _caption(
             fp,
             prompt,
             fps,
-            mf,
+            dur,
             mt,
             temp,
             tp,
@@ -837,42 +854,153 @@ def _build_caption_tab(
             url,
             tout,
             res_name,
+            do_stream,
         ):
             if not fp:
                 raise gr.Error("Upload a file first")
             mode = detect_mode(fp)
             rs = _RESOLUTION_MAP.get(res_name, 1.0)
+            mf = _dur_to_frames(dur, fps)
+
+            def _warn_html(truncated: bool):
+                if truncated:
+                    return gr.update(
+                        visible=True,
+                        value=(
+                            '<div style="background:#442200;border:1px solid #664400;'
+                            'border-radius:4px;padding:8px;margin:4px 0;color:#ffcc66">'
+                            "<b>Truncated:</b> The model used all tokens on reasoning "
+                            "and never produced a caption. Increase <b>Max Tokens</b> "
+                            "and try again.</div>"
+                        ),
+                    )
+                return gr.update(visible=False)
+
+            if not do_stream:
+                try:
+                    cap, thinking, meta, truncated, res = await _do_caption(
+                        fp, mode, prompt, fps, mf, int(mt),
+                        temp, tp, int(tk), mp, pp, url, tout, rs,
+                    )
+                except LlamaVideoError as e:
+                    raise gr.Error(str(e)) from e
+                except Exception as e:
+                    raise gr.Error(f"Error: {e}") from e
+                _save_result(res)
+                yield cap, thinking, meta, _warn_html(truncated)
+                return
+
+            # ── Streaming path ──
+            cfg = ServerConfig(url=url, timeout=tout)
+            client = LlamaServerClient(cfg)
+            preset = InferencePreset(
+                name="webui",
+                temperature=temp,
+                top_p=tp,
+                top_k=int(tk),
+                min_p=mp,
+                presence_penalty=pp,
+            )
+            start = time.monotonic()
+
             try:
-                cap, meta, res = await _do_caption(
-                    fp,
-                    mode,
-                    prompt,
-                    fps,
-                    int(mf),
-                    int(mt),
-                    temp,
-                    tp,
-                    int(tk),
-                    mp,
-                    pp,
-                    url,
-                    tout,
-                    rs,
-                )
+                if mode == "video":
+                    ext = Extractor()
+                    pre = Preprocessor()
+                    frames = await ext.extract_frames_async(
+                        fp, ExtractorConfig(fps=fps, max_frames=mf),
+                    )
+                    vi = pre.process(frames, fps=fps, resolution_scale=rs)
+
+                    final_thinking = ""
+                    final_caption = ""
+                    async for thinking, caption, _ in client.stream_caption_video(
+                        vi, prompt=prompt, max_tokens=int(mt), preset=preset,
+                    ):
+                        final_thinking = thinking
+                        final_caption = caption
+                        yield caption, thinking, "", gr.update(visible=False)
+
+                    ms = (time.monotonic() - start) * 1000
+                    meta = build_metadata_html(
+                        "video", len(frames), len(vi.super_frames),
+                        vi.grid_thw, vi.resolution, ms,
+                    )
+                    res = CaptionResult(
+                        caption=final_caption,
+                        source_path=fp,
+                        mode="video",
+                        prompt_rendered=prompt,
+                        template_name=None,
+                        variables={},
+                        preset_name="webui",
+                        settings={"fps": fps, "max_frames": mf, "max_tokens": int(mt)},
+                        metadata=CaptionMetadata(
+                            frames_extracted=len(frames),
+                            super_frames=len(vi.super_frames),
+                            grid_thw=vi.grid_thw,
+                            processing_time_ms=ms,
+                        ),
+                        token_usage=None,
+                        duration_ms=ms,
+                    )
+                else:
+                    final_thinking = ""
+                    final_caption = ""
+                    async for thinking, caption, _ in client.stream_caption_image(
+                        fp, prompt=prompt, max_tokens=int(mt), preset=preset,
+                    ):
+                        final_thinking = thinking
+                        final_caption = caption
+                        yield caption, thinking, "", gr.update(visible=False)
+
+                    ms = (time.monotonic() - start) * 1000
+                    img = load_image(fp)
+                    ih, iw = img.shape[:2]
+                    m = ModelConfig.qwen35()
+                    gu = m.grid_unit
+                    tw = max(gu, round(iw / gu) * gu)
+                    th = max(gu, round(ih / gu) * gu)
+                    hg, wg = th // gu, tw // gu
+                    meta = build_metadata_html(
+                        "image", 1, 0, (1, hg, wg), (tw, th), ms,
+                    )
+                    res = CaptionResult(
+                        caption=final_caption,
+                        source_path=fp,
+                        mode="image",
+                        prompt_rendered=prompt,
+                        template_name=None,
+                        variables={},
+                        preset_name="webui",
+                        settings={"max_tokens": int(mt)},
+                        metadata=CaptionMetadata(
+                            frames_extracted=1,
+                            super_frames=0,
+                            grid_thw=(1, hg, wg),
+                            processing_time_ms=ms,
+                        ),
+                        token_usage=None,
+                        duration_ms=ms,
+                    )
+
+                _save_result(res)
+                yield final_caption, final_thinking, meta, _warn_html(client.last_truncated)
+
             except LlamaVideoError as e:
                 raise gr.Error(str(e)) from e
             except Exception as e:
                 raise gr.Error(f"Error: {e}") from e
-            _save_result(res)
-            return cap, meta
+            finally:
+                await client.close()
 
-        c_btn.click(
+        caption_event = c_btn.click(
             fn=_caption,
             inputs=[
                 c_file,
                 c_prompt,
                 c_fps,
-                c_mf,
+                c_dur,
                 c_mt,
                 c_temp,
                 c_tp,
@@ -882,9 +1010,11 @@ def _build_caption_tab(
                 c_url,
                 c_tout,
                 c_res,
+                c_stream,
             ],
-            outputs=[c_out, c_meta],
+            outputs=[c_out, c_think, c_meta, c_warn],
         )
+        c_cancel.click(fn=None, cancels=[caption_event])
 
         c_chk.click(
             fn=_check_health,
@@ -952,20 +1082,22 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
         async def _cmp_upload(
             fp,
             af,
-            amf,
+            adur,
             ap,
             amt,
             bf,
-            bmf,
+            bdur,
             bp,
             bmt,
         ):
             if fp is None:
-                return "", {}, empty_budget, empty_budget
+                return "", {}, empty_budget, empty_budget, gr.update(), gr.update()
             mode = detect_mode(fp)
             if mode == "video":
                 info = await _probe_video(fp)
-                txt = f"Video: {info['width']}\u00d7{info['height']}, {info['duration']:.1f}s"
+                vid_dur = float(info.get("duration", 0)) or 30.0
+                txt = f"Video: {info['width']}\u00d7{info['height']}, {vid_dur:.1f}s"
+                dur_upd = gr.update(maximum=vid_dur, value=vid_dur)
             else:
                 img = load_image(fp)
                 ih, iw = img.shape[:2]
@@ -976,35 +1108,23 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
                     "mode": "image",
                 }
                 txt = f"Image: {iw}\u00d7{ih}"
+                vid_dur = 1.0
+                dur_upd = gr.update()
 
-            ba = compute_budget(
-                info,
-                af,
-                int(amf),
-                ap,
-                int(amt),
-                65536,
-            )
-            bb = compute_budget(
-                info,
-                bf,
-                int(bmf),
-                bp,
-                int(bmt),
-                65536,
-            )
-            return txt, info, ba, bb
+            ba = compute_budget(info, af, adur, ap, int(amt), 65536)
+            bb = compute_budget(info, bf, bdur, bp, int(bmt), 65536)
+            return txt, info, ba, bb, dur_upd, dur_upd
 
         cmp_file.change(
             fn=_cmp_upload,
             inputs=[
                 cmp_file,
                 a["fps"],
-                a["mf"],
+                a["dur"],
                 a["prompt"],
                 a["mt"],
                 b["fps"],
-                b["mf"],
+                b["dur"],
                 b["prompt"],
                 b["mt"],
             ],
@@ -1013,28 +1133,23 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
                 cmp_info,
                 a["budget"],
                 b["budget"],
+                a["dur"],
+                b["dur"],
             ],
         )
 
         # Budget updates on slider changes
-        def _cmp_bgt(vi, f, mf, p, mt):
-            return compute_budget(
-                vi,
-                f,
-                int(mf),
-                p,
-                int(mt),
-                65536,
-            )
+        def _cmp_bgt(vi, f, dur, p, mt):
+            return compute_budget(vi, f, dur, p, int(mt), 65536)
 
         for side in [a, b]:
-            for _c in [side["fps"], side["mf"], side["mt"]]:
+            for _c in [side["fps"], side["dur"], side["mt"]]:
                 _c.change(
                     fn=_cmp_bgt,
                     inputs=[
                         cmp_info,
                         side["fps"],
-                        side["mf"],
+                        side["dur"],
                         side["prompt"],
                         side["mt"],
                     ],
@@ -1065,7 +1180,7 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
             fp,
             pr,
             fps,
-            mf,
+            dur,
             mt,
             te,
             tp,
@@ -1080,13 +1195,14 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
                 raise gr.Error("Upload a file first")
             mode = detect_mode(fp)
             rs = _RESOLUTION_MAP.get(res_name, 1.0)
+            mf = _dur_to_frames(dur, fps)
             try:
-                cap, meta, res = await _do_caption(
+                cap, _thinking, meta, _truncated, res = await _do_caption(
                     fp,
                     mode,
                     pr,
                     fps,
-                    int(mf),
+                    mf,
                     int(mt),
                     te,
                     tp,
@@ -1109,7 +1225,7 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
                 cmp_file,
                 side["prompt"],
                 side["fps"],
-                side["mf"],
+                side["dur"],
                 side["mt"],
                 side["temp"],
                 side["tp"],
@@ -1176,12 +1292,12 @@ def _compare_column(
                 step=0.5,
                 label="FPS",
             )
-            mf = gr.Slider(
-                2,
-                256,
-                value=64,
-                step=2,
-                label="Max Frames",
+            dur = gr.Slider(
+                0.5,
+                300,
+                value=30,
+                step=0.5,
+                label="Duration (s)",
             )
         res = gr.Dropdown(
             label="Resolution",
@@ -1253,7 +1369,7 @@ def _compare_column(
         "tmpl": tmpl,
         "prompt": prompt,
         "fps": fps,
-        "mf": mf,
+        "dur": dur,
         "res": res,
         "preset": preset,
         "temp": temp,
@@ -1314,12 +1430,12 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
                     step=0.5,
                     label="FPS",
                 )
-                ba_mf = gr.Slider(
-                    2,
-                    256,
-                    value=64,
-                    step=2,
-                    label="Max Frames",
+                ba_dur = gr.Slider(
+                    0.5,
+                    300,
+                    value=30,
+                    step=0.5,
+                    label="Duration (s)",
                 )
                 ba_res = gr.Dropdown(
                     label="Resolution",
@@ -1362,7 +1478,7 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
             files,
             prompt,
             fps,
-            mf,
+            dur,
             mt,
             temp,
             url,
@@ -1374,17 +1490,18 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
                 raise gr.Error("No files uploaded")
             p = get_preset(preset_name)
             rs = _RESOLUTION_MAP.get(res_name, 1.0)
+            mf = _dur_to_frames(dur, fps)
             rows: list[list[str]] = []
             for fp in files:
                 name = Path(fp).name
                 try:
                     mode = detect_mode(fp)
-                    cap, _, res = await _do_caption(
+                    cap, _, _, _, res = await _do_caption(
                         fp,
                         mode,
                         prompt,
                         fps,
-                        int(mf),
+                        mf,
                         int(mt),
                         temp,
                         p.top_p,
@@ -1422,7 +1539,7 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
                 ba_files,
                 ba_prompt,
                 ba_fps,
-                ba_mf,
+                ba_dur,
                 ba_mt,
                 ba_temp,
                 ba_url,

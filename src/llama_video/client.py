@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -18,10 +20,57 @@ from llama_video.errors import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from llama_video.config import InferencePreset, ServerConfig
     from llama_video.preprocessor import VideoInput
 
 logger = logging.getLogger(__name__)
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+_THINK_OPEN = "<think>"
+
+
+def parse_model_response(text: str) -> tuple[str, str, bool]:
+    """Parse thinking tags from a model response.
+
+    Returns:
+        (caption, thinking, truncated) where truncated is True if the
+        model was cut off mid-thought (unclosed <think> tag).
+    """
+    if not text:
+        return "", "", False
+
+    m = _THINK_RE.search(text)
+    if m:
+        thinking = m.group(1).strip()
+        caption = text[m.end() :].strip()
+        return caption, thinking, False
+
+    # Unclosed <think> — model was truncated during reasoning
+    if _THINK_OPEN in text:
+        thinking = text.split(_THINK_OPEN, 1)[1].strip()
+        return "", thinking, True
+
+    return text.strip(), "", False
+
+
+def _parse_stream_state(raw: str) -> tuple[str, str, bool]:
+    """Parse accumulated streaming text into (thinking, caption, still_thinking).
+
+    Unlike parse_model_response (used for final results), this handles
+    the intermediate state where tokens are still arriving.
+    """
+    if _THINK_OPEN not in raw:
+        return "", raw, False
+
+    _, after_open = raw.split(_THINK_OPEN, 1)
+
+    if "</think>" in after_open:
+        thinking, caption = after_open.split("</think>", 1)
+        return thinking, caption, False
+
+    return after_open, "", True
 
 
 class LlamaServerClient:
@@ -39,6 +88,8 @@ class LlamaServerClient:
             config = ServerConfig()
         self._config = config
         self._client: httpx.AsyncClient | None = None
+        self.last_thinking: str = ""
+        self.last_truncated: bool = False
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -126,6 +177,15 @@ class LlamaServerClient:
             "content": content,
         }
 
+    @staticmethod
+    def _extract_content(data: dict[str, Any]) -> str:
+        """Extract text content from a chat completions response."""
+        msg = data["choices"][0]["message"]
+        content = msg.get("content", "") or ""
+        if not content:
+            content = msg.get("reasoning_content", "") or ""
+        return str(content)
+
     async def caption_video(
         self,
         video_input: VideoInput,
@@ -208,13 +268,18 @@ class LlamaServerClient:
                     )
 
                 data = response.json()
-                msg = data["choices"][0]["message"]
-                caption = msg.get("content", "") or ""
-                if not caption:
-                    # Thinking models (Qwen3.5 with --jinja) put output in reasoning_content
-                    caption = msg.get("reasoning_content", "") or ""
+                raw = self._extract_content(data)
+                caption, thinking, truncated = parse_model_response(raw)
+                self.last_thinking = thinking
+                self.last_truncated = truncated
+                if thinking:
+                    logger.info(
+                        "Thinking: %d chars%s",
+                        len(thinking),
+                        " (truncated)" if truncated else "",
+                    )
                 logger.info("Caption received: %d chars", len(caption))
-                return str(caption)
+                return caption
 
             except httpx.ConnectError as e:
                 last_error = ServerUnreachableError(
@@ -309,12 +374,18 @@ class LlamaServerClient:
                     )
 
                 data = response.json()
-                msg = data["choices"][0]["message"]
-                caption = msg.get("content", "") or ""
-                if not caption:
-                    caption = msg.get("reasoning_content", "") or ""
+                raw = self._extract_content(data)
+                caption, thinking, truncated = parse_model_response(raw)
+                self.last_thinking = thinking
+                self.last_truncated = truncated
+                if thinking:
+                    logger.info(
+                        "Image thinking: %d chars%s",
+                        len(thinking),
+                        " (truncated)" if truncated else "",
+                    )
                 logger.info("Image caption received: %d chars", len(caption))
-                return str(caption)
+                return caption
 
             except httpx.ConnectError as e:
                 last_error = ServerUnreachableError(
@@ -338,6 +409,154 @@ class LlamaServerClient:
         if last_error is not None:
             raise last_error
         raise ServerUnreachableError("Failed to connect to llama-server after retries")
+
+    async def _iter_sse_tokens(
+        self,
+        payload: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """Stream SSE tokens from /v1/chat/completions.
+
+        Yields individual token strings as they arrive.
+        """
+        client = await self._get_client()
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=payload,
+        ) as response:
+            if response.status_code == 503:
+                await response.aread()
+                raise ModelNotLoadedError(
+                    "llama-server has no model loaded",
+                    context={"status": 503},
+                )
+            if response.status_code != 200:
+                await response.aread()
+                raise ServerResponseError(
+                    f"llama-server error {response.status_code}",
+                    context={"status": response.status_code},
+                )
+
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                token = delta.get("content", "") or ""
+                if token:
+                    yield token
+
+    async def stream_caption_video(
+        self,
+        video_input: VideoInput,
+        prompt: str,
+        max_tokens: int = 2048,
+        temperature: float | None = None,
+        preset: InferencePreset | None = None,
+    ) -> AsyncGenerator[tuple[str, str, bool], None]:
+        """Stream video caption, yielding (thinking, caption, still_thinking).
+
+        After the generator is exhausted, last_thinking and last_truncated
+        are set on the client instance.
+        """
+        if preset is None:
+            from llama_video.config import get_preset
+
+            preset = get_preset("default")
+
+        effective_temp = temperature if temperature is not None else preset.temperature
+        message = self._build_video_message(video_input, prompt)
+
+        payload: dict[str, Any] = {
+            "messages": [message],
+            "max_tokens": max_tokens,
+            "temperature": effective_temp,
+            "top_p": preset.top_p,
+            "top_k": preset.top_k,
+            "min_p": preset.min_p,
+            "presence_penalty": preset.presence_penalty,
+            "stream": True,
+            "mm_processor_kwargs": {
+                "fps": video_input.fps,
+                "is_video": True,
+                "grid_thw": list(video_input.grid_thw),
+                "temporal_positions": video_input.temporal_positions,
+            },
+        }
+
+        if self._config.model_name:
+            payload["model"] = self._config.model_name
+
+        logger.info(
+            "Streaming %d frames to llama-server (grid_thw=%s)",
+            video_input.num_source_frames,
+            video_input.grid_thw,
+        )
+
+        raw = ""
+        async for token in self._iter_sse_tokens(payload):
+            raw += token
+            thinking, caption, still_thinking = _parse_stream_state(raw)
+            yield thinking, caption, still_thinking
+
+        caption, thinking, truncated = parse_model_response(raw)
+        self.last_thinking = thinking
+        self.last_truncated = truncated
+
+    async def stream_caption_image(
+        self,
+        image_path: str,
+        prompt: str,
+        max_tokens: int = 2048,
+        temperature: float | None = None,
+        preset: InferencePreset | None = None,
+    ) -> AsyncGenerator[tuple[str, str, bool], None]:
+        """Stream image caption, yielding (thinking, caption, still_thinking)."""
+        if preset is None:
+            from llama_video.config import get_preset
+
+            preset = get_preset("default")
+
+        effective_temp = temperature if temperature is not None else preset.temperature
+
+        from llama_video.image import build_image_message
+
+        message = build_image_message(image_path, prompt)
+
+        payload: dict[str, Any] = {
+            "messages": [message],
+            "max_tokens": max_tokens,
+            "temperature": effective_temp,
+            "top_p": preset.top_p,
+            "top_k": preset.top_k,
+            "min_p": preset.min_p,
+            "presence_penalty": preset.presence_penalty,
+            "stream": True,
+        }
+
+        if self._config.model_name:
+            payload["model"] = self._config.model_name
+
+        logger.info("Streaming image to llama-server: %s", image_path)
+
+        raw = ""
+        async for token in self._iter_sse_tokens(payload):
+            raw += token
+            thinking, caption, still_thinking = _parse_stream_state(raw)
+            yield thinking, caption, still_thinking
+
+        caption, thinking, truncated = parse_model_response(raw)
+        self.last_thinking = thinking
+        self.last_truncated = truncated
 
     async def health_check(self) -> bool:
         """Check if llama-server is reachable and healthy."""

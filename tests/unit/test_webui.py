@@ -94,13 +94,14 @@ class TestBuildMetadataHtml:
 
 class TestComputeBudget:
     def test_empty_info(self):
-        html = compute_budget({}, 2.0, 64, "test", 2048, 65536)
+        # caption_dur=10s, fps=2.0
+        html = compute_budget({}, 2.0, 10.0, "test", 2048, 65536)
         assert "Gen: 2,048" in html
         assert "Vision" not in html
 
     def test_zero_width(self):
         info = {"width": 0, "height": 0, "mode": "video"}
-        html = compute_budget(info, 2.0, 64, "test", 2048, 65536)
+        html = compute_budget(info, 2.0, 10.0, "test", 2048, 65536)
         assert "Vision" not in html
 
     def test_video_budget(self):
@@ -113,7 +114,7 @@ class TestComputeBudget:
         html = compute_budget(
             info,
             2.0,
-            64,
+            5.0,  # caption full 5s
             "test prompt",
             2048,
             65536,
@@ -131,47 +132,38 @@ class TestComputeBudget:
         html = compute_budget(
             info,
             1.0,
-            1,
+            1.0,
             "test",
             2048,
             65536,
         )
         assert "Vision" in html
 
-    def test_video_duration_limits_frames(self):
-        # 2s video at 2fps = 4 frames max
+    def test_longer_duration_more_tokens(self):
         info = {
-            "width": 280,
-            "height": 280,
-            "duration": 2.0,
-            "mode": "video",
-        }
-        html_short = compute_budget(
-            info,
-            2.0,
-            64,
-            "",
-            2048,
-            65536,
-        )
-        # 10s video at 2fps = 20 frames
-        info2 = {
             "width": 280,
             "height": 280,
             "duration": 10.0,
             "mode": "video",
         }
-        html_long = compute_budget(
-            info2,
-            2.0,
-            64,
-            "",
-            2048,
-            65536,
-        )
-        # Longer video should use more vision tokens
-        # (both have same resolution, so more frames = more tokens)
+        # 2s at 2fps = 4 frames
+        html_short = compute_budget(info, 2.0, 2.0, "", 2048, 65536)
+        # 10s at 2fps = 20 frames
+        html_long = compute_budget(info, 2.0, 10.0, "", 2048, 65536)
         assert html_short != html_long
+
+    def test_higher_fps_more_tokens(self):
+        info = {
+            "width": 280,
+            "height": 280,
+            "duration": 10.0,
+            "mode": "video",
+        }
+        # 10s at 2fps = 20 frames
+        html_2fps = compute_budget(info, 2.0, 10.0, "", 2048, 65536)
+        # 10s at 4fps = 40 frames
+        html_4fps = compute_budget(info, 4.0, 10.0, "", 2048, 65536)
+        assert html_2fps != html_4fps
 
     def test_resolution_scale_reduces_tokens(self):
         info = {
@@ -180,11 +172,9 @@ class TestComputeBudget:
             "duration": 5.0,
             "mode": "video",
         }
-        html_full = compute_budget(info, 2.0, 64, "", 2048, 65536, 1.0)
-        html_half = compute_budget(info, 2.0, 64, "", 2048, 65536, 0.5)
-        # Half resolution should use fewer vision tokens
+        html_full = compute_budget(info, 2.0, 5.0, "", 2048, 65536, 1.0)
+        html_half = compute_budget(info, 2.0, 5.0, "", 2048, 65536, 0.5)
         assert html_full != html_half
-        # Full should have Vision tokens, half should too (but fewer)
         assert "Vision" in html_full
         assert "Vision" in html_half
 
@@ -198,7 +188,7 @@ class TestComputeBudget:
         html = compute_budget(
             info,
             2.0,
-            64,
+            5.0,
             "test",
             2048,
             131072,

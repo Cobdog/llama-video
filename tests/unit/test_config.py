@@ -39,7 +39,7 @@ class TestServerConfig:
     def test_defaults(self):
         config = ServerConfig()
         assert config.url == "http://localhost:8080"
-        assert config.timeout == 120.0
+        assert config.timeout == 600.0
         assert config.max_retries == 3
 
     def test_from_env(self, monkeypatch):
