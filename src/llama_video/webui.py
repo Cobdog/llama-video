@@ -391,18 +391,46 @@ async def _caption_image(
 
 
 async def _check_health(url: str, timeout: float) -> str:
-    """Check llama-server health, return status HTML."""
-    cfg = ServerConfig(url=url, timeout=min(timeout, 10))
-    client = LlamaServerClient(cfg)
+    """Check llama-server health and loaded model, return status HTML."""
+    import httpx as _httpx
+
+    short_timeout = _httpx.Timeout(min(timeout, 10))
     try:
-        ok = await client.health_check()
-        if ok:
-            return '<span style="color:#50c878;font-weight:bold">\u25cf Connected</span>'
-        return '<span style="color:#ffaa00;font-weight:bold">\u25cf Degraded</span>'
+        async with _httpx.AsyncClient(base_url=url, timeout=short_timeout) as c:
+            resp = await c.get("/health")
+            if resp.status_code != 200:
+                return (
+                    '<span style="color:#ffaa00;font-weight:bold">'
+                    "\u25cf Degraded</span>"
+                )
+
+            # Server is up — query loaded model
+            model_name = ""
+            try:
+                mr = await c.get("/v1/models")
+                if mr.status_code == 200:
+                    data = mr.json().get("data", [])
+                    if data:
+                        model_name = data[0].get("id", "")
+            except Exception:
+                pass
+
+            status = '<span style="color:#50c878;font-weight:bold">\u25cf Connected</span>'
+            if model_name:
+                status += (
+                    f'<br><span style="color:#aaa;font-size:12px">'
+                    f"Model: <b>{model_name}</b></span>"
+                )
+            else:
+                status += (
+                    '<br><span style="color:#888;font-size:12px">'
+                    "No model loaded</span>"
+                )
+            return status
+    except (_httpx.ConnectError, _httpx.TimeoutException):
+        return '<span style="color:#ff4444;font-weight:bold">\u25cf Unreachable</span>'
     except Exception:
         return '<span style="color:#ff4444;font-weight:bold">\u25cf Unreachable</span>'
-    finally:
-        await client.close()
 
 
 def _save_result(result: CaptionResult) -> None:
@@ -448,7 +476,8 @@ def _on_preset_change(name: str) -> tuple[Any, ...]:
 def create_app() -> gr.Blocks:
     """Build the complete Gradio application."""
     empty_budget = build_budget_html(0, 0, 2048, 65536)
-    not_checked = '<span style="color:#888">Not checked</span>'
+    checking = '<span style="color:#888">Checking\u2026</span>'
+    _default_cfg = ServerConfig()
 
     with gr.Blocks(
         title="llama-video",
@@ -460,10 +489,17 @@ def create_app() -> gr.Blocks:
         )
 
         with gr.Tabs():
-            _build_caption_tab(empty_budget, not_checked)
-            _build_compare_tab(empty_budget)
-            _build_batch_tab()
+            cap_refs = _build_caption_tab(empty_budget, checking, _default_cfg)
+            _build_compare_tab(empty_budget, _default_cfg)
+            _build_batch_tab(_default_cfg)
             _build_history_tab()
+
+        # Auto-check server on page load
+        app.load(
+            fn=_check_health,
+            inputs=[cap_refs["url"], cap_refs["tout"]],
+            outputs=[cap_refs["status"]],
+        )
 
     return app
 
@@ -471,8 +507,13 @@ def create_app() -> gr.Blocks:
 def _build_caption_tab(
     empty_budget: str,
     not_checked: str,
-) -> None:
-    """Build the main Caption tab with all controls."""
+    default_cfg: ServerConfig,
+) -> dict[str, Any]:
+    """Build the main Caption tab with all controls.
+
+    Returns dict with 'url', 'tout', and 'status' components
+    so the app can wire up auto-check on load.
+    """
     with gr.TabItem("Caption"):
         vi_state: gr.State = gr.State(value={})
 
@@ -607,12 +648,12 @@ def _build_caption_tab(
                 gr.Markdown("### Server")
                 c_url = gr.Textbox(
                     label="Server URL",
-                    value="http://localhost:8080",
+                    value=default_cfg.url,
                 )
                 c_tout = gr.Slider(
                     30,
                     1200,
-                    value=300,
+                    value=default_cfg.timeout,
                     step=30,
                     label="Timeout (s)",
                 )
@@ -850,8 +891,10 @@ def _build_caption_tab(
             outputs=[c_status],
         )
 
+    return {"url": c_url, "tout": c_tout, "status": c_status}
 
-def _build_compare_tab(empty_budget: str) -> None:
+
+def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
     """Build the side-by-side Compare tab."""
     with gr.TabItem("Compare"):
         cmp_info: gr.State = gr.State(value={})
@@ -886,13 +929,13 @@ def _build_compare_tab(empty_budget: str) -> None:
         with gr.Row():
             cmp_url = gr.Textbox(
                 label="Server URL",
-                value="http://localhost:8080",
+                value=default_cfg.url,
                 scale=3,
             )
             cmp_tout = gr.Slider(
                 30,
                 1200,
-                value=300,
+                value=default_cfg.timeout,
                 step=30,
                 label="Timeout",
                 scale=1,
@@ -1225,7 +1268,7 @@ def _compare_column(
     }
 
 
-def _build_batch_tab() -> None:
+def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
     """Build the Batch processing tab."""
     with gr.TabItem("Batch"):
         with gr.Row():
@@ -1301,14 +1344,15 @@ def _build_batch_tab() -> None:
                     step=64,
                     label="Max Tokens",
                 )
+                _bc = default_cfg or ServerConfig()
                 ba_url = gr.Textbox(
                     label="Server URL",
-                    value="http://localhost:8080",
+                    value=_bc.url,
                 )
                 ba_tout = gr.Slider(
                     30,
                     1200,
-                    value=300,
+                    value=_bc.timeout,
                     step=30,
                     label="Timeout",
                 )
