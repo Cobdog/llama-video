@@ -220,6 +220,64 @@ class TestPresetPassthrough:
         assert body["presence_penalty"] == 1.5
 
 
+class TestCachePrompt:
+    """Test cache_prompt passthrough to server payload."""
+
+    @pytest.mark.asyncio
+    async def test_cache_prompt_defaults_true(self, respx_mock, mock_video_input):
+        """Default cache_prompt is True."""
+        config = ServerConfig(url="http://test-server:8080")
+        client = LlamaServerClient(config)
+        route = respx_mock.post("http://test-server:8080/v1/chat/completions").respond(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+        await client.caption_video(mock_video_input, "test")
+        await client.close()
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["cache_prompt"] is True
+
+    @pytest.mark.asyncio
+    async def test_cache_prompt_false_passthrough(self, respx_mock, mock_video_input):
+        """cache_prompt=False is sent to server."""
+        config = ServerConfig(url="http://test-server:8080")
+        client = LlamaServerClient(config)
+        route = respx_mock.post("http://test-server:8080/v1/chat/completions").respond(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+        await client.caption_video(mock_video_input, "test", cache_prompt=False)
+        await client.close()
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["cache_prompt"] is False
+
+    @pytest.mark.asyncio
+    async def test_image_cache_prompt_passthrough(self, respx_mock, tmp_path):
+        """cache_prompt is threaded through image captioning."""
+        from PIL import Image as PILImage
+
+        img = PILImage.fromarray(np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8))
+        img_path = tmp_path / "test.jpg"
+        img.save(str(img_path))
+
+        config = ServerConfig(url="http://test-server:8080")
+        client = LlamaServerClient(config)
+        route = respx_mock.post("http://test-server:8080/v1/chat/completions").respond(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+        await client.caption_image(str(img_path), "test", cache_prompt=False)
+        await client.close()
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["cache_prompt"] is False
+
+
 class TestImageCaptioning:
     """Test image captioning via client."""
 

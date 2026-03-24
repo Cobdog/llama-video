@@ -245,6 +245,7 @@ async def _do_caption(
     server_url: str,
     timeout: float,
     resolution_scale: float = 1.0,
+    cache_prompt: bool = True,
 ) -> tuple[str, str, str, bool, CaptionResult]:
     """Full pipeline: extract, preprocess, infer, return.
 
@@ -273,6 +274,7 @@ async def _do_caption(
                 client,
                 start,
                 resolution_scale,
+                cache_prompt,
             )
         return await _caption_image(
             path,
@@ -281,6 +283,7 @@ async def _do_caption(
             preset,
             client,
             start,
+            cache_prompt,
         )
     finally:
         await client.close()
@@ -296,6 +299,7 @@ async def _caption_video(
     client: LlamaServerClient,
     start: float,
     resolution_scale: float = 1.0,
+    cache_prompt: bool = True,
 ) -> tuple[str, str, str, bool, CaptionResult]:
     """Video captioning sub-pipeline."""
     ext = Extractor()
@@ -310,6 +314,7 @@ async def _caption_video(
         prompt=prompt,
         max_tokens=max_tokens,
         preset=preset,
+        cache_prompt=cache_prompt,
     )
     thinking = client.last_thinking
     truncated = client.last_truncated
@@ -354,6 +359,7 @@ async def _caption_image(
     preset: InferencePreset,
     client: LlamaServerClient,
     start: float,
+    cache_prompt: bool = True,
 ) -> tuple[str, str, str, bool, CaptionResult]:
     """Image captioning sub-pipeline."""
     cap = await client.caption_image(
@@ -361,6 +367,7 @@ async def _caption_image(
         prompt=prompt,
         max_tokens=max_tokens,
         preset=preset,
+        cache_prompt=cache_prompt,
     )
     thinking = client.last_thinking
     truncated = client.last_truncated
@@ -528,6 +535,9 @@ def _build_caption_tab(
     """
     with gr.TabItem("Caption"):
         vi_state: gr.State = gr.State(value={})
+        # Track visual params from last request to decide cache_prompt.
+        # Keys: file, fps, duration, resolution_scale
+        last_visual: gr.State = gr.State(value=None)
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -867,16 +877,23 @@ def _build_caption_tab(
             tout,
             res_name,
             do_stream,
+            prev_visual,
         ):
             if not fp:
                 raise gr.Error("Upload a file first")
             mode = detect_mode(fp)
             rs = _RESOLUTION_MAP.get(res_name, 1.0)
             mf = _dur_to_frames(dur, fps)
+
+            # Decide cache_prompt: allow cache only when visual input
+            # is identical to last request (i.e. only sampler changes).
+            # First run (prev_visual is None) always invalidates.
+            cur_visual = (fp, fps, dur, rs)
+            use_cache = prev_visual is not None and cur_visual == prev_visual
             logger.info(
                 "Caption: fps=%.1f, dur=%.1f, res=%s (scale=%.3f), "
-                "frames=%d, max_tokens=%s, stream=%s",
-                fps, dur, res_name, rs, mf, mt, do_stream,
+                "frames=%d, max_tokens=%s, stream=%s, cache=%s",
+                fps, dur, res_name, rs, mf, mt, do_stream, use_cache,
             )
 
             def _warn_html(truncated: bool):
@@ -898,13 +915,14 @@ def _build_caption_tab(
                     cap, thinking, meta, truncated, res = await _do_caption(
                         fp, mode, prompt, fps, mf, int(mt),
                         temp, tp, int(tk), mp, pp, url, tout, rs,
+                        use_cache,
                     )
                 except LlamaVideoError as e:
                     raise gr.Error(str(e)) from e
                 except Exception as e:
                     raise gr.Error(f"Error: {e}") from e
                 _save_result(res)
-                yield cap, thinking, meta, _warn_html(truncated)
+                yield cap, thinking, meta, _warn_html(truncated), cur_visual
                 return
 
             # ── Streaming path ──
@@ -933,10 +951,11 @@ def _build_caption_tab(
                     final_caption = ""
                     async for thinking, caption, _ in client.stream_caption_video(
                         vi, prompt=prompt, max_tokens=int(mt), preset=preset,
+                        cache_prompt=use_cache,
                     ):
                         final_thinking = thinking
                         final_caption = caption
-                        yield caption, thinking, "", gr.update(visible=False)
+                        yield caption, thinking, "", gr.update(visible=False), cur_visual
 
                     ms = (time.monotonic() - start) * 1000
                     meta = build_metadata_html(
@@ -966,10 +985,11 @@ def _build_caption_tab(
                     final_caption = ""
                     async for thinking, caption, _ in client.stream_caption_image(
                         fp, prompt=prompt, max_tokens=int(mt), preset=preset,
+                        cache_prompt=use_cache,
                     ):
                         final_thinking = thinking
                         final_caption = caption
-                        yield caption, thinking, "", gr.update(visible=False)
+                        yield caption, thinking, "", gr.update(visible=False), cur_visual
 
                     ms = (time.monotonic() - start) * 1000
                     img = load_image(fp)
@@ -1002,7 +1022,7 @@ def _build_caption_tab(
                     )
 
                 _save_result(res)
-                yield final_caption, final_thinking, meta, _warn_html(client.last_truncated)
+                yield final_caption, final_thinking, meta, _warn_html(client.last_truncated), cur_visual
 
             except LlamaVideoError as e:
                 raise gr.Error(str(e)) from e
@@ -1028,8 +1048,9 @@ def _build_caption_tab(
                 c_tout,
                 c_res,
                 c_stream,
+                last_visual,
             ],
-            outputs=[c_out, c_think, c_meta, c_warn],
+            outputs=[c_out, c_think, c_meta, c_warn, last_visual],
         )
         c_cancel.click(fn=None, cancels=[caption_event])
 

@@ -193,6 +193,7 @@ class LlamaServerClient:
         max_tokens: int = 2048,
         temperature: float | None = None,
         preset: InferencePreset | None = None,
+        cache_prompt: bool = True,
     ) -> str:
         """Send preprocessed video to llama-server and get a caption.
 
@@ -230,7 +231,7 @@ class LlamaServerClient:
             "top_k": preset.top_k,
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
-            "cache_prompt": False,
+            "cache_prompt": cache_prompt,
             # Video metadata for the C patch
             "mm_processor_kwargs": {
                 "fps": video_input.fps,
@@ -244,9 +245,10 @@ class LlamaServerClient:
             payload["model"] = self._config.model_name
 
         logger.info(
-            "Sending %d frames to llama-server (grid_thw=%s)",
+            "Sending %d frames to llama-server (grid_thw=%s, cache=%s)",
             video_input.num_source_frames,
             video_input.grid_thw,
+            cache_prompt,
         )
 
         attempt = 0
@@ -312,6 +314,7 @@ class LlamaServerClient:
         max_tokens: int = 2048,
         temperature: float | None = None,
         preset: InferencePreset | None = None,
+        cache_prompt: bool = True,
     ) -> str:
         """Send an image to llama-server and get a caption.
 
@@ -348,13 +351,13 @@ class LlamaServerClient:
             "top_k": preset.top_k,
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
-            "cache_prompt": False,
+            "cache_prompt": cache_prompt,
         }
 
         if self._config.model_name:
             payload["model"] = self._config.model_name
 
-        logger.info("Sending image to llama-server: %s", image_path)
+        logger.info("Sending image to llama-server: %s (cache=%s)", image_path, cache_prompt)
 
         attempt = 0
         last_error: Exception | None = None
@@ -473,6 +476,7 @@ class LlamaServerClient:
         max_tokens: int = 2048,
         temperature: float | None = None,
         preset: InferencePreset | None = None,
+        cache_prompt: bool = True,
     ) -> AsyncGenerator[tuple[str, str, bool], None]:
         """Stream video caption, yielding (thinking, caption, still_thinking).
 
@@ -496,7 +500,7 @@ class LlamaServerClient:
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
             "stream": True,
-            "cache_prompt": False,
+            "cache_prompt": cache_prompt,
             "mm_processor_kwargs": {
                 "fps": video_input.fps,
                 "is_video": True,
@@ -509,9 +513,10 @@ class LlamaServerClient:
             payload["model"] = self._config.model_name
 
         logger.info(
-            "Streaming %d frames to llama-server (grid_thw=%s)",
+            "Streaming %d frames to llama-server (grid_thw=%s, cache=%s)",
             video_input.num_source_frames,
             video_input.grid_thw,
+            cache_prompt,
         )
 
         raw = ""
@@ -531,6 +536,7 @@ class LlamaServerClient:
         max_tokens: int = 2048,
         temperature: float | None = None,
         preset: InferencePreset | None = None,
+        cache_prompt: bool = True,
     ) -> AsyncGenerator[tuple[str, str, bool], None]:
         """Stream image caption, yielding (thinking, caption, still_thinking)."""
         if preset is None:
@@ -553,13 +559,13 @@ class LlamaServerClient:
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
             "stream": True,
-            "cache_prompt": False,
+            "cache_prompt": cache_prompt,
         }
 
         if self._config.model_name:
             payload["model"] = self._config.model_name
 
-        logger.info("Streaming image to llama-server: %s", image_path)
+        logger.info("Streaming image to llama-server: %s (cache=%s)", image_path, cache_prompt)
 
         raw = ""
         async for token in self._iter_sse_tokens(payload):
