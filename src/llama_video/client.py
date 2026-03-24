@@ -437,6 +437,7 @@ class LlamaServerClient:
                     context={"status": response.status_code},
                 )
 
+            token_count = 0
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -446,14 +447,22 @@ class LlamaServerClient:
                 try:
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
+                    logger.debug("SSE: failed to parse: %s", data_str[:200])
                     continue
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
                 token = delta.get("content", "") or ""
+                if not token:
+                    token = delta.get("reasoning_content", "") or ""
+                if token_count == 0 and token:
+                    logger.info("SSE: first token received, delta keys=%s", list(delta.keys()))
                 if token:
+                    token_count += 1
                     yield token
+
+            logger.info("SSE: stream complete, %d tokens received", token_count)
 
     async def stream_caption_video(
         self,
