@@ -1,16 +1,257 @@
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index bf55cec..e93858a 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -388,6 +388,7 @@ struct clip_image_u8_batch {
+ struct clip_image_f32_batch {
+     std::vector<clip_image_f32_ptr> entries;
+     bool is_audio = false;
++    bool is_video = false;  // true if entries are 6-channel video super-frames
+ 
+     // for llava-uhd style models, we need to know the grid size
+     // note: entries.size() == grid_x * grid_y + 1 (one overview image)
+@@ -398,6 +399,7 @@ struct clip_image_f32_batch {
+         clip_image_f32_batch new_batch{
+             /* entries  */ {},
+             /* is_audio */ is_audio,
++            /* is_video */ is_video,
+             /* grid_x   */ grid_x,
+             /* grid_y   */ grid_y,
+         };
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index a47f1f4..cad9819 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -3411,6 +3411,33 @@ size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h
+     return clip_n_output_tokens(ctx, &img) * clip_n_mmproj_embd(ctx) * sizeof(float);
+ }
+ 
++bool clip_image_preprocess_video_superframe(
++        struct clip_ctx * ctx,
++        const float * chw_data,
++        int width,
++        int height,
++        struct clip_image_f32_batch * res_imgs) {
++    (void)ctx;
++    const int n_channels = 6;
++    const int n_pixels = width * height;
++
++    clip_image_f32_ptr img_f32(clip_image_f32_init());
++    img_f32->nx = width;
++    img_f32->ny = height;
++    img_f32->buf.resize(n_pixels * n_channels);
++
++    // Convert from CHW (Python/numpy) to HWC-interleaved (clip_image_f32 convention)
++    for (int i = 0; i < n_pixels; i++) {
++        for (int c = 0; c < n_channels; c++) {
++            img_f32->buf[i * n_channels + c] = chw_data[c * n_pixels + i];
++        }
++    }
++
++    res_imgs->entries.push_back(std::move(img_f32));
++    res_imgs->is_video = true;
++    return true;
++}
++
+ int32_t clip_get_image_size(const struct clip_ctx * ctx) {
+     return ctx->model.hparams.image_size;
+ }
+@@ -3689,37 +3716,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
+ 
+     // set input pixel values
+     if (!imgs.is_audio) {
++        // Detect channel count from actual data: 6 for video super-frames, 3 for images
++        const auto & first_img = *imgs.entries[0];
++        const int n_channels = (first_img.buf.size() == (size_t)(first_img.nx * first_img.ny * 6)) ? 6 : 3;
+         size_t nelem = 0;
+         for (const auto & img : imgs.entries) {
+-            nelem += img->nx * img->ny * 3;
++            nelem += img->nx * img->ny * n_channels;
+         }
+         std::vector<float> inp_raw(nelem);
+ 
+-        // layout of data (note: the channel dim is unrolled to better visualize the layout):
+-        //
+-        // ┌──W──┐
+-        // │     H │  channel = R
+-        // ├─────┤ │
+-        // │     H │  channel = G
+-        // ├─────┤ │
+-        // │     H │  channel = B
+-        // └─────┘ │
+-        //   ──────┘ x B
+-
++        // Transpose from HWC-interleaved (clip_image_f32.buf) to CHW-planar (GGML tensor)
++        // For images: 3 channels (R, G, B)
++        // For video super-frames: 6 channels (R1, G1, B1, R2, G2, B2)
+         for (size_t i = 0; i < imgs.entries.size(); i++) {
+             const int nx = imgs.entries[i]->nx;
+             const int ny = imgs.entries[i]->ny;
+             const int n = nx * ny;
+ 
+             for (int b = 0; b < batch_size; b++) {
+-                float * batch_entry = inp_raw.data() + b * (3*n);
++                float * batch_entry = inp_raw.data() + b * (n_channels * n);
+                 for (int y = 0; y < ny; y++) {
+                     for (int x = 0; x < nx; x++) {
+-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
+-                        size_t base_dst =    y * nx + x;  // idx of the first channel
+-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
+-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
+-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
++                        size_t base_src = n_channels * (y * nx + x);
++                        size_t base_dst =              y * nx + x;
++                        for (int c = 0; c < n_channels; c++) {
++                            batch_entry[c * n + base_dst] = imgs.entries[b]->buf[base_src + c];
++                        }
+                     }
+                 }
+             }
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+index 71b5848..bf0b392 100644
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -100,6 +100,14 @@ void clip_build_img_from_pixels(const unsigned char * rgb_pixels, int nx, int ny
+ /** preprocess img and store the result in res_imgs, pad_to_square may be overridden to false depending on model configuration */
+ bool clip_image_preprocess(struct clip_ctx * ctx, const struct clip_image_u8 * img, struct clip_image_f32_batch * res_imgs );
+ 
++/** preprocess a video super-frame: accepts pre-processed CHW float data, converts to internal format */
++bool clip_image_preprocess_video_superframe(
++    struct clip_ctx * ctx,
++    const float * chw_data,   /* 6*H*W floats in channel-first [C,H,W] order */
++    int width,
++    int height,
++    struct clip_image_f32_batch * res_imgs);
++
+ struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
+ 
+ bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, struct clip_image_f32 * img, float * vec);
+diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
+index fa1100d..f86a472 100644
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -13,16 +13,47 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
+ 
+     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
+ 
+-    ggml_tensor * inp_raw = build_inp_raw();
+-    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
++    const bool is_video_input = (img.buf.size() == (size_t)(img.nx * img.ny * 6));
++    const int n_channels      = is_video_input ? 6 : 3;
++
++    ggml_tensor * inp_raw = build_inp_raw(n_channels);
+ 
+     GGML_ASSERT(img.nx % (patch_size * 2) == 0);
+     GGML_ASSERT(img.ny % (patch_size * 2) == 0);
+ 
+-    // second conv dimension
+-    {
+-        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
++    ggml_tensor * inp;
++    if (is_video_input) {
++        // Video: split 6-channel super-frame into two 3-channel frames
++        // inp_raw shape: [nx, ny, 6] — channels are the outermost (slowest) dimension
++        // frame_a = channels 0-2 (offset 0), frame_b = channels 3-5
++        const size_t channel_plane_bytes = ggml_row_size(inp_raw->type, img.nx) * img.ny;
++        ggml_tensor * frame_a = ggml_view_3d(ctx0, inp_raw,
++            img.nx, img.ny, 3,
++            ggml_row_size(inp_raw->type, img.nx),  // nb1: stride between rows
++            channel_plane_bytes,                     // nb2: stride between channels
++            0);                                      // offset: start of channels 0-2
++        ggml_tensor * frame_b = ggml_view_3d(ctx0, inp_raw,
++            img.nx, img.ny, 3,
++            ggml_row_size(inp_raw->type, img.nx),
++            channel_plane_bytes,
++            channel_plane_bytes * 3);                // offset: start of channels 3-5
++
++        // Conv2D(frame_a, weight_t0) + Conv2D(frame_b, weight_t1) = Conv3D decomposition
++        inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, frame_a,
++                           patch_size, patch_size, 0, 0, 1, 1);
++        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, frame_b,
++                                  patch_size, patch_size, 0, 0, 1, 1);
++        inp = ggml_add(ctx0, inp, inp_1);
++    } else {
++        // Image: both Conv2D kernels applied to same 3-channel input (temporal=1)
++        inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw,
++                           patch_size, patch_size, 0, 0, 1, 1);
++        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw,
++                                  patch_size, patch_size, 0, 0, 1, 1);
+         inp = ggml_add(ctx0, inp, inp_1);
++    }
++
++    {
+ 
+         inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
+         inp = ggml_cont_4d(
 diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
-index d5a6bad..611818b 100644
+index 5bcb7ec..611818b 100644
 --- a/tools/mtmd/mtmd-helper.cpp
 +++ b/tools/mtmd/mtmd-helper.cpp
-@@ -303,14 +303,23 @@ int32_t mtmd_helper_decode_image_chunk(
+@@ -174,6 +174,37 @@ struct decode_embd_batch {
+         }
+     }
+ 
++    // M-RoPE for video (3D: temporal + height + width)
++    // temporal_positions: array of nt temporal indices (one per super-frame)
++    // Each super-frame contributes nx * ny tokens
++    void set_position_mrope_3d(
++            llama_pos pos_0,
++            int nx, int ny, int nt,
++            const int32_t * temporal_positions,
++            llama_seq_id seq_id) {
++        GGML_ASSERT(n_pos_per_embd == 4);
++        GGML_ASSERT(batch.n_tokens == nx * ny * nt);
++        seq_id_0[0] = seq_id;
++
++        for (int t = 0; t < nt; t++) {
++            int32_t t_pos = temporal_positions[t];
++            for (int y = 0; y < ny; y++) {
++                for (int x = 0; x < nx; x++) {
++                    int i = t * (nx * ny) + y * nx + x;
++                    pos[i                     ] = pos_0 + t_pos; // temporal
++                    pos[i + batch.n_tokens    ] = pos_0 + y;     // height
++                    pos[i + batch.n_tokens * 2] = pos_0 + x;     // width
++                    pos[i + batch.n_tokens * 3] = 0;             // unused
++                }
++            }
++        }
++        for (int i = 0; i < batch.n_tokens; i++) {
++            batch.n_seq_id[i] = 1;
++            batch.seq_id  [i] = seq_id_0.data();
++            batch.logits  [i] = false;
++        }
++    }
++
+     // M-RoPE for audio
+     void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
+         GGML_ASSERT(n_pos_per_embd == 4);
+@@ -236,9 +267,11 @@ int32_t mtmd_helper_decode_image_chunk(
+         int32_t n_batch,
+         llama_pos * new_n_past) {
+     auto chunk_type = mtmd_input_chunk_get_type(chunk);
+-    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
++    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image"
++                      : chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video"
++                      : "audio";
+     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+-        LOG_ERR("failed to decode chunk: input chunk not of image/audio type\n");
++        LOG_ERR("failed to decode chunk: input chunk not of image/video/audio type\n");
+         return -1;
+     }
+ 
+@@ -261,6 +294,32 @@ int32_t mtmd_helper_decode_image_chunk(
              const int nx = mtmd_image_tokens_get_nx(image_tokens);
              const int ny = mtmd_image_tokens_get_ny(image_tokens);
-             const int nt = mtmd_image_tokens_get_nt(image_tokens);
--            // Sequential temporal positions (0, 1, 2, ...)
--            // Phase 3 will refine to pass actual M-RoPE temporal indices from Python
--            std::vector<int32_t> temporal_positions(nt);
--            for (int t = 0; t < nt; t++) {
--                temporal_positions[t] = t;
+             batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
++        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
++            const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
++            if (!image_tokens) {
++                LOG_ERR("failed to decode chunk: video tokens are null\n");
++                return -1;
++            }
++            const int nx = mtmd_image_tokens_get_nx(image_tokens);
++            const int ny = mtmd_image_tokens_get_ny(image_tokens);
++            const int nt = mtmd_image_tokens_get_nt(image_tokens);
 +
 +            // Use stored temporal positions if available, else fall back to sequential
 +            size_t n_tp = 0;
@@ -25,35 +266,64 @@ index d5a6bad..611818b 100644
 +                    fallback_tp[t] = t;
 +                }
 +                tp = fallback_tp.data();
-             }
--            batch_embd.set_position_mrope_3d(n_past, nx, ny, nt,
--                                              temporal_positions.data(), seq_id);
++            }
 +
 +            batch_embd.set_position_mrope_3d(n_past, nx, ny, nt, tp, seq_id);
          } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
              batch_embd.set_position_mrope_1d(n_past, seq_id);
          } else {
+@@ -346,8 +405,12 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+             *new_n_past += text_batch.n_tokens;
+         }
+ 
+-    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+-        const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
++    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++            || chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO
++            || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
++        const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image"
++                          : chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video"
++                          : "audio";
+         int64_t t0 = ggml_time_ms();
+ 
+         LOG_INF("encoding %s slice...\n", name);
 diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
-index 93a1cb5..5134148 100644
+index 456ce7b..5134148 100644
 --- a/tools/mtmd/mtmd.cpp
 +++ b/tools/mtmd/mtmd.cpp
-@@ -37,6 +37,7 @@ struct mtmd_image_tokens {
+@@ -35,8 +35,10 @@ struct mtmd_bitmap {
+ struct mtmd_image_tokens {
+     uint32_t nx; // number of tokens in x direction
      uint32_t ny; // number of tokens in y direction
-     uint32_t nt = 1; // number of temporal positions (1 for images, >1 for video)
++    uint32_t nt = 1; // number of temporal positions (1 for images, >1 for video)
      bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
+-    uint32_t n_tokens() const { return nx * ny; }
 +    std::vector<int32_t> temporal_positions; // M-RoPE temporal indices (one per temporal position)
-     uint32_t n_tokens() const { return nx * ny * nt; }
++    uint32_t n_tokens() const { return nx * ny * nt; }
      clip_image_f32_batch batch_f32; // preprocessed image patches
      std::string id; // optional user-defined ID, useful for KV cache tracking
-@@ -47,6 +48,7 @@ struct mtmd_image_tokens {
+ 
+@@ -44,7 +46,9 @@ struct mtmd_image_tokens {
+         return mtmd_image_tokens{
+             nx,
              ny,
-             nt,
++            nt,
              use_mrope_pos,
 +            temporal_positions,
              batch_f32.clone(),
              id
          };
-@@ -810,6 +812,195 @@ struct mtmd_tokenizer {
+@@ -381,7 +385,8 @@ struct mtmd_context {
+ 
+     // get clip ctx based on chunk type
+     clip_ctx * get_clip_ctx(const mtmd_input_chunk * chunk) const {
+-        if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++        if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++                || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+             return ctx_v;
+         } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+             return ctx_a;
+@@ -807,6 +812,195 @@ struct mtmd_tokenizer {
      }
  };
  
@@ -249,10 +519,98 @@ index 93a1cb5..5134148 100644
  int32_t mtmd_tokenize(mtmd_context * ctx,
              mtmd_input_chunks * output,
              const mtmd_input_text * text,
-@@ -1129,6 +1320,17 @@ size_t mtmd_image_tokens_get_nt(const mtmd_image_tokens * image_tokens) {
-     return image_tokens->nt;
+@@ -820,7 +1014,8 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+         LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
+         return 0;
+-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++            || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+         if (!ctx->ctx_v) {
+             LOG_ERR("%s: model does not support vision input\n", __func__);
+             return 1;
+@@ -856,19 +1051,28 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens)
+     ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
+     bool ok = false;
+ 
++    const auto & entries = image_tokens->batch_f32.entries;
++
+     if (clip_is_llava(ctx_clip)
+         || clip_is_minicpmv(ctx_clip)
+         || clip_is_glm(ctx_clip)
+-        || proj_type == PROJECTOR_TYPE_INTERNVL) {
+-        // TODO @ngxson : llava does not support batched encoding ; this should be fixed inside clip_image_batch_encode()
+-        const auto & entries = image_tokens->batch_f32.entries;
++        || proj_type == PROJECTOR_TYPE_INTERNVL
++        || image_tokens->batch_f32.is_video) {
++        // Encode entries one at a time:
++        // - llava/minicpmv/glm: don't support batched encoding
++        // - video: clip_image_batch_encode only supports batch_size=1,
++        //          so we encode each super-frame individually
+         for (size_t i = 0; i < entries.size(); i++) {
+-            int n_tokens_per_image = clip_n_output_tokens(ctx_clip, entries[i].get());
++            int n_tokens_per_entry = clip_n_output_tokens(ctx_clip, entries[i].get());
+             ok = clip_image_encode(
+                 ctx_clip,
+                 ctx->n_threads,
+                 entries[i].get(),
+-                ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_image);
++                ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_entry);
++            if (!ok) {
++                LOG_ERR("%s: failed to encode entry %zu/%zu\n", __func__, i, entries.size());
++                return 1;
++            }
+         }
+     } else {
+         ok = clip_image_batch_encode(
+@@ -1029,7 +1233,8 @@ const llama_token * mtmd_input_chunk_get_tokens_text(const mtmd_input_chunk * ch
  }
  
+ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chunk * chunk) {
+-    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++            || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+         return chunk->tokens_image.get();
+     }
+     return nullptr;
+@@ -1038,7 +1243,8 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
+ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
+     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+         return chunk->tokens_text.size();
+-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++            || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+         return mtmd_image_tokens_get_n_tokens(chunk->tokens_image.get());
+     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+         return chunk->tokens_audio->n_tokens;
+@@ -1050,7 +1256,8 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
+ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
+     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+         return chunk->tokens_text.size();
+-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++            || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+         return mtmd_image_tokens_get_n_pos(chunk->tokens_image.get());
+     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+         return chunk->tokens_audio->n_tokens;
+@@ -1060,7 +1267,8 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
+ }
+ 
+ const char * mtmd_input_chunk_get_id(const mtmd_input_chunk * chunk) {
+-    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++            || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+         return chunk->tokens_image->id.c_str();
+     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+         return chunk->tokens_audio->id.c_str();
+@@ -1108,6 +1316,21 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
+     return image_tokens->ny;
+ }
+ 
++size_t mtmd_image_tokens_get_nt(const mtmd_image_tokens * image_tokens) {
++    return image_tokens->nt;
++}
++
 +const int32_t * mtmd_image_tokens_get_temporal_positions(
 +        const mtmd_image_tokens * image_tokens,
 +        size_t * n_positions) {
@@ -267,14 +625,33 @@ index 93a1cb5..5134148 100644
  const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
      return image_tokens->id.c_str();
  }
+@@ -1115,8 +1338,7 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
+ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
+     if (image_tokens->use_mrope_pos) {
+         // for M-RoPE, temporal dimension = max(t,h,w)
+-        // t is omitted as we don't support video input
+-        return std::max(image_tokens->nx, image_tokens->ny);
++        return std::max({image_tokens->nt, image_tokens->nx, image_tokens->ny});
+     }
+     return image_tokens->n_tokens();
+ }
 diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
-index a394224..144ae90 100644
+index ebb4a18..144ae90 100644
 --- a/tools/mtmd/mtmd.h
 +++ b/tools/mtmd/mtmd.h
-@@ -189,10 +189,32 @@ MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * i
+@@ -57,6 +57,7 @@ enum mtmd_input_chunk_type {
+     MTMD_INPUT_CHUNK_TYPE_TEXT,
+     MTMD_INPUT_CHUNK_TYPE_IMAGE,
+     MTMD_INPUT_CHUNK_TYPE_AUDIO,
++    MTMD_INPUT_CHUNK_TYPE_VIDEO,
+ };
+ 
+ // opaque types
+@@ -187,10 +188,33 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
+ MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens); // TODO: deprecate
  MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
  MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
- MTMD_API size_t       mtmd_image_tokens_get_nt      (const mtmd_image_tokens * image_tokens); // temporal positions (1 for images, >1 for video)
++MTMD_API size_t       mtmd_image_tokens_get_nt      (const mtmd_image_tokens * image_tokens); // temporal positions (1 for images, >1 for video)
 +// get temporal positions array for video chunks (nullptr for images)
 +// n_positions will be set to the number of temporal positions
 +MTMD_API const int32_t * mtmd_image_tokens_get_temporal_positions(

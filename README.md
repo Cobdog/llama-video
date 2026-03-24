@@ -51,10 +51,13 @@ pip install ".[ui]"
 
 ### Step 2: Clone and patch llama.cpp
 
-The patch targets llama.cpp's `master` branch. It may need adjustment if upstream has diverged significantly — see [Patch Compatibility](#patch-compatibility) below.
+The patch targets llama.cpp commit `cc18f96`. If master has moved forward and the patch fails, pin to this commit.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git checkout cc18f96
+cd ..
 llama-video-patch ./llama.cpp
 ```
 
@@ -62,6 +65,7 @@ Or manually:
 
 ```bash
 cd llama.cpp
+git checkout cc18f96
 git apply /path/to/llama-video/patches/video-support-20260323.patch
 ```
 

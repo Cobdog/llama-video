@@ -1,6 +1,6 @@
 [project]
 name = "llama-video"
-version = "0.1.1"
+version = "0.1.2"
 description = "Temporal video support for llama.cpp — frame extraction, preprocessing, and captioning service for Qwen3.5 GGUF models"
 readme = "README.md"
 license = {text = "MIT"}
