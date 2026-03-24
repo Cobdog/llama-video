@@ -179,6 +179,9 @@ class LlamaServerClient:
             },
         }
 
+        if self._config.model_name:
+            payload["model"] = self._config.model_name
+
         logger.info(
             "Sending %d frames to llama-server (grid_thw=%s)",
             video_input.num_source_frames,
@@ -280,6 +283,9 @@ class LlamaServerClient:
             "min_p": preset.min_p,
             "presence_penalty": preset.presence_penalty,
         }
+
+        if self._config.model_name:
+            payload["model"] = self._config.model_name
 
         logger.info("Sending image to llama-server: %s", image_path)
 
