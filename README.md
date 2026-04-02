@@ -51,12 +51,12 @@ pip install ".[ui]"
 
 ### Step 2: Clone and patch llama.cpp
 
-The patch targets llama.cpp commit `cc18f96`. If master has moved forward and the patch fails, pin to this commit.
+The patch targets llama.cpp commit `7c20367`. If master has moved forward and the patch fails, pin to this commit.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout cc18f96
+git checkout 7c20367
 cd ..
 llama-video-patch ./llama.cpp
 ```
@@ -65,7 +65,7 @@ Or manually:
 
 ```bash
 cd llama.cpp
-git checkout cc18f96
+git checkout 7c20367
 git apply /path/to/llama-video/patches/video-support-20260323.patch
 ```
 
@@ -257,7 +257,7 @@ Built-in templates with `{variable}` substitution:
 
 ### Patch Compatibility
 
-The patch was built against llama.cpp `master` as of 2026-03-23. It modifies files in `tools/mtmd/` (clip.cpp, mtmd.cpp, mtmd.h, mtmd-helper.cpp) and `examples/server/server.cpp`. If upstream has refactored these files, the patch may not apply cleanly.
+The patch was built against llama.cpp `master` as of 2026-03-29 (commit `7c20367`). It modifies files in `tools/mtmd/` (clip.cpp, mtmd.cpp, mtmd.h, mtmd-helper.cpp) and `examples/server/server.cpp`. If upstream has refactored these files, the patch may not apply cleanly.
 
 **If the patch fails to apply:**
 
