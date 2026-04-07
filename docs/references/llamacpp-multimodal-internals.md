@@ -1,7 +1,7 @@
 # llama.cpp Multimodal Internals
 
 > **Source:** llama.cpp source code, Issue #18389, Issue #17660, PR #19468
-> **Last verified:** 2026-03-23
+> **Last verified:** 2026-04-07
 
 ## Architecture
 
@@ -43,7 +43,9 @@ LLM (llama.cpp core)
 | `tools/mtmd/clip.cpp` | Vision encoder: patch embed, ViT, Conv3D, normalization |
 | `tools/mtmd/mtmd-cli.cpp` | CLI tool for testing multimodal input |
 | `tools/mtmd/mtmd-helper.cpp` | Utility functions |
-| `examples/server/server.cpp` | HTTP server with `/chat/completions` endpoint |
+| `tools/server/server-common.cpp` | HTTP server common utilities and request parsing |
+| `tools/server/server-common.h` | Server common header |
+| `tools/server/server-context.cpp` | Server context and `/chat/completions` endpoint |
 
 ## clip.cpp — Vision Encoder
 

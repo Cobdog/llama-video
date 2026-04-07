@@ -8,7 +8,7 @@ Adds temporal video support to llama.cpp's multimodal pipeline (super-frames, te
 |------|-------------|
 | `video-support-20260323.patch` | Unified patch: 6-channel super-frame input, temporal M-RoPE positions, video chunk type, server `mm_processor_kwargs` passthrough |
 
-**Target files:** `tools/mtmd/clip.cpp`, `tools/mtmd/mtmd.cpp`, `tools/mtmd/mtmd.h`, `tools/mtmd/mtmd-helper.cpp`, `examples/server/server.cpp`
+**Target files:** `tools/mtmd/clip-impl.h`, `tools/mtmd/clip.cpp`, `tools/mtmd/clip.h`, `tools/mtmd/models/qwen3vl.cpp`, `tools/mtmd/mtmd-helper.cpp`, `tools/mtmd/mtmd.cpp`, `tools/mtmd/mtmd.h`, `tools/server/server-common.cpp`, `tools/server/server-common.h`, `tools/server/server-context.cpp`
 
 ## How to Apply
 
