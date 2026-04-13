@@ -51,12 +51,12 @@ pip install ".[ui]"
 
 ### Step 2: Clone and patch llama.cpp
 
-The patch targets llama.cpp commit `0033f53`. If master has moved forward and the patch fails, pin to this commit.
+The patch targets llama.cpp commit `a8bad38`. If master has moved forward and the patch fails, pin to this commit.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 0033f53
+git checkout a8bad38
 cd ..
 llama-video-patch ./llama.cpp
 ```
@@ -65,8 +65,8 @@ Or manually:
 
 ```bash
 cd llama.cpp
-git checkout 0033f53
-git apply /path/to/llama-video/patches/video-support-20260323.patch
+git checkout a8bad38
+git apply /path/to/llama-video/patches/video-support-20260413.patch
 ```
 
 ### Step 3: Build llama.cpp
@@ -257,14 +257,14 @@ Built-in templates with `{variable}` substitution:
 
 ### Patch Compatibility
 
-The patch was built against llama.cpp `master` as of 2026-04-07 (commit `0033f53`). It modifies files in `tools/mtmd/` (clip-impl.h, clip.cpp, clip.h, models/qwen3vl.cpp, mtmd.cpp, mtmd.h, mtmd-helper.cpp) and `tools/server/` (server-common.cpp, server-common.h, server-context.cpp). If upstream has refactored these files, the patch may not apply cleanly.
+The patch was built against llama.cpp `master` as of 2026-04-13 (commit `a8bad38`). It modifies files in `tools/mtmd/` (clip-impl.h, clip.cpp, clip.h, models/qwen3vl.cpp, mtmd.cpp, mtmd.h, mtmd-helper.cpp) and `tools/server/` (server-common.cpp, server-common.h, server-context.cpp). If upstream has refactored these files, the patch may not apply cleanly.
 
 **If the patch fails to apply:**
 
 ```bash
 cd llama.cpp
 git log --oneline -1    # Note your current commit
-git apply --check /path/to/patches/video-support-20260323.patch  # Dry run to see conflicts
+git apply --check /path/to/patches/video-support-20260413.patch  # Dry run to see conflicts
 ```
 
 You may need to apply manually or wait for an updated patch.

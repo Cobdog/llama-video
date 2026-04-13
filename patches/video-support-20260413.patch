@@ -1,8 +1,8 @@
 diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
-index 81b9284..f699db5 100644
+index 17cb703..eb6da77 100644
 --- a/tools/mtmd/clip-impl.h
 +++ b/tools/mtmd/clip-impl.h
-@@ -423,6 +423,7 @@ struct clip_image_u8_batch {
+@@ -448,6 +448,7 @@ struct clip_image_u8_batch {
  struct clip_image_f32_batch {
      std::vector<clip_image_f32_ptr> entries;
      bool is_audio = false;
@@ -10,7 +10,7 @@ index 81b9284..f699db5 100644
  
      // for llava-uhd style models, we need to know the grid size
      // note: entries.size() == grid_x * grid_y + 1 (one overview image)
-@@ -433,6 +434,7 @@ struct clip_image_f32_batch {
+@@ -458,6 +459,7 @@ struct clip_image_f32_batch {
          clip_image_f32_batch new_batch{
              /* entries  */ {},
              /* is_audio */ is_audio,
@@ -19,10 +19,10 @@ index 81b9284..f699db5 100644
              /* grid_y   */ grid_y,
          };
 diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index 2faf595..bf098c8 100644
+index f0e8786..f553ef1 100644
 --- a/tools/mtmd/clip.cpp
 +++ b/tools/mtmd/clip.cpp
-@@ -2586,6 +2586,33 @@ size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h
+@@ -2770,6 +2770,33 @@ size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h
      return clip_n_output_tokens(ctx, &img) * clip_n_mmproj_embd(ctx) * sizeof(float);
  }
  
@@ -56,7 +56,7 @@ index 2faf595..bf098c8 100644
  int32_t clip_get_image_size(const struct clip_ctx * ctx) {
      return ctx->model.hparams.image_size;
  }
-@@ -2885,37 +2912,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
+@@ -3100,37 +3127,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
  
      // set input pixel values
      if (!imgs.is_audio) {
@@ -184,7 +184,7 @@ index fa1100d..f86a472 100644
          inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
          inp = ggml_cont_4d(
 diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
-index 778aacb..755ecae 100644
+index 2f45dab..6793f2b 100644
 --- a/tools/mtmd/mtmd-helper.cpp
 +++ b/tools/mtmd/mtmd-helper.cpp
 @@ -176,6 +176,37 @@ struct decode_embd_batch {
@@ -272,7 +272,7 @@ index 778aacb..755ecae 100644
          } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
              batch_embd.set_position_mrope_1d(n_past, seq_id);
          } else {
-@@ -351,8 +410,12 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+@@ -352,8 +411,12 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
              *new_n_past += text_batch.n_tokens;
          }
  
@@ -288,7 +288,7 @@ index 778aacb..755ecae 100644
  
          LOG_INF("encoding %s slice...\n", name);
 diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
-index 4b6dd44..0c8fdf3 100644
+index dc2bde1..7854673 100644
 --- a/tools/mtmd/mtmd.cpp
 +++ b/tools/mtmd/mtmd.cpp
 @@ -36,8 +36,10 @@ struct mtmd_bitmap {
@@ -313,7 +313,7 @@ index 4b6dd44..0c8fdf3 100644
              batch_f32.clone(),
              id
          };
-@@ -471,7 +475,8 @@ struct mtmd_context {
+@@ -502,7 +506,8 @@ struct mtmd_context {
  
      // get clip ctx based on chunk type
      clip_ctx * get_clip_ctx(const mtmd_input_chunk * chunk) const {
@@ -323,7 +323,7 @@ index 4b6dd44..0c8fdf3 100644
              return ctx_v;
          } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
              return ctx_a;
-@@ -907,6 +912,195 @@ struct mtmd_tokenizer {
+@@ -939,6 +944,195 @@ struct mtmd_tokenizer {
      }
  };
  
@@ -519,7 +519,7 @@ index 4b6dd44..0c8fdf3 100644
  int32_t mtmd_tokenize(mtmd_context * ctx,
              mtmd_input_chunks * output,
              const mtmd_input_text * text,
-@@ -920,7 +1114,8 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+@@ -952,7 +1146,8 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
      if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
          LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
          return 0;
@@ -529,7 +529,7 @@ index 4b6dd44..0c8fdf3 100644
          if (!ctx->ctx_v) {
              LOG_ERR("%s: model does not support vision input\n", __func__);
              return 1;
-@@ -956,19 +1151,28 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens)
+@@ -988,19 +1183,28 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens)
      ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
      bool ok = false;
  
@@ -563,7 +563,7 @@ index 4b6dd44..0c8fdf3 100644
          }
      } else {
          ok = clip_image_batch_encode(
-@@ -1130,7 +1334,8 @@ const llama_token * mtmd_input_chunk_get_tokens_text(const mtmd_input_chunk * ch
+@@ -1170,7 +1374,8 @@ const llama_token * mtmd_input_chunk_get_tokens_text(const mtmd_input_chunk * ch
  }
  
  const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chunk * chunk) {
@@ -573,7 +573,7 @@ index 4b6dd44..0c8fdf3 100644
          return chunk->tokens_image.get();
      }
      return nullptr;
-@@ -1139,7 +1344,8 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
+@@ -1179,7 +1384,8 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
  size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
      if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
          return chunk->tokens_text.size();
@@ -583,7 +583,7 @@ index 4b6dd44..0c8fdf3 100644
          return mtmd_image_tokens_get_n_tokens(chunk->tokens_image.get());
      } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
          return chunk->tokens_audio->n_tokens;
-@@ -1151,7 +1357,8 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
+@@ -1191,7 +1397,8 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
  llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
      if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
          return chunk->tokens_text.size();
@@ -593,7 +593,7 @@ index 4b6dd44..0c8fdf3 100644
          return mtmd_image_tokens_get_n_pos(chunk->tokens_image.get());
      } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
          return chunk->tokens_audio->n_tokens;
-@@ -1161,7 +1368,8 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
+@@ -1201,7 +1408,8 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
  }
  
  const char * mtmd_input_chunk_get_id(const mtmd_input_chunk * chunk) {
@@ -603,7 +603,7 @@ index 4b6dd44..0c8fdf3 100644
          return chunk->tokens_image->id.c_str();
      } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
          return chunk->tokens_audio->id.c_str();
-@@ -1209,6 +1417,21 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
+@@ -1249,6 +1457,21 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
      return image_tokens->ny;
  }
  
@@ -625,7 +625,7 @@ index 4b6dd44..0c8fdf3 100644
  const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
      return image_tokens->id.c_str();
  }
-@@ -1216,8 +1439,7 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
+@@ -1256,8 +1479,7 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
  llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
      if (image_tokens->use_mrope_pos) {
          // for M-RoPE, temporal dimension = max(t,h,w)
@@ -636,7 +636,7 @@ index 4b6dd44..0c8fdf3 100644
      return image_tokens->n_tokens();
  }
 diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
-index ebb4a18..144ae90 100644
+index 2ecf956..9d12d4a 100644
 --- a/tools/mtmd/mtmd.h
 +++ b/tools/mtmd/mtmd.h
 @@ -57,6 +57,7 @@ enum mtmd_input_chunk_type {
@@ -647,7 +647,7 @@ index ebb4a18..144ae90 100644
  };
  
  // opaque types
-@@ -187,10 +188,33 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
+@@ -188,10 +189,33 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
  MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens); // TODO: deprecate
  MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
  MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
@@ -804,10 +804,10 @@ index 213ae52..e73f444 100644
  /**
   * break the input "prompt" object into multiple prompt if needed, then tokenize them
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 5523f23..242de4f 100644
+index b31981c..d2a5719 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -3096,7 +3096,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -3101,7 +3101,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
          if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
              // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
