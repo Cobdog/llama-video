@@ -1,8 +1,8 @@
 diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
-index 17cb703..eb6da77 100644
+index 7d6484e..6469777 100644
 --- a/tools/mtmd/clip-impl.h
 +++ b/tools/mtmd/clip-impl.h
-@@ -448,6 +448,7 @@ struct clip_image_u8_batch {
+@@ -461,6 +461,7 @@ struct clip_image_u8_batch {
  struct clip_image_f32_batch {
      std::vector<clip_image_f32_ptr> entries;
      bool is_audio = false;
@@ -10,7 +10,7 @@ index 17cb703..eb6da77 100644
  
      // for llava-uhd style models, we need to know the grid size
      // note: entries.size() == grid_x * grid_y + 1 (one overview image)
-@@ -458,6 +459,7 @@ struct clip_image_f32_batch {
+@@ -471,6 +472,7 @@ struct clip_image_f32_batch {
          clip_image_f32_batch new_batch{
              /* entries  */ {},
              /* is_audio */ is_audio,
@@ -19,10 +19,10 @@ index 17cb703..eb6da77 100644
              /* grid_y   */ grid_y,
          };
 diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index f0e8786..f553ef1 100644
+index 45e3989..21f5c5a 100644
 --- a/tools/mtmd/clip.cpp
 +++ b/tools/mtmd/clip.cpp
-@@ -2770,6 +2770,33 @@ size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h
+@@ -2845,6 +2845,33 @@ size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h
      return clip_n_output_tokens(ctx, &img) * clip_n_mmproj_embd(ctx) * sizeof(float);
  }
  
@@ -56,7 +56,7 @@ index f0e8786..f553ef1 100644
  int32_t clip_get_image_size(const struct clip_ctx * ctx) {
      return ctx->model.hparams.image_size;
  }
-@@ -3100,37 +3127,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
+@@ -3182,37 +3209,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
  
      // set input pixel values
      if (!imgs.is_audio) {
@@ -184,48 +184,10 @@ index fa1100d..f86a472 100644
          inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
          inp = ggml_cont_4d(
 diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
-index 2f45dab..6793f2b 100644
+index 4094074..6e91ff3 100644
 --- a/tools/mtmd/mtmd-helper.cpp
 +++ b/tools/mtmd/mtmd-helper.cpp
-@@ -176,6 +176,37 @@ struct decode_embd_batch {
-         }
-     }
- 
-+    // M-RoPE for video (3D: temporal + height + width)
-+    // temporal_positions: array of nt temporal indices (one per super-frame)
-+    // Each super-frame contributes nx * ny tokens
-+    void set_position_mrope_3d(
-+            llama_pos pos_0,
-+            int nx, int ny, int nt,
-+            const int32_t * temporal_positions,
-+            llama_seq_id seq_id) {
-+        GGML_ASSERT(n_pos_per_embd == 4);
-+        GGML_ASSERT(batch.n_tokens == nx * ny * nt);
-+        seq_id_0[0] = seq_id;
-+
-+        for (int t = 0; t < nt; t++) {
-+            int32_t t_pos = temporal_positions[t];
-+            for (int y = 0; y < ny; y++) {
-+                for (int x = 0; x < nx; x++) {
-+                    int i = t * (nx * ny) + y * nx + x;
-+                    pos[i                     ] = pos_0 + t_pos; // temporal
-+                    pos[i + batch.n_tokens    ] = pos_0 + y;     // height
-+                    pos[i + batch.n_tokens * 2] = pos_0 + x;     // width
-+                    pos[i + batch.n_tokens * 3] = 0;             // unused
-+                }
-+            }
-+        }
-+        for (int i = 0; i < batch.n_tokens; i++) {
-+            batch.n_seq_id[i] = 1;
-+            batch.seq_id  [i] = seq_id_0.data();
-+            batch.logits  [i] = false;
-+        }
-+    }
-+
-     // M-RoPE for audio
-     void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
-         GGML_ASSERT(n_pos_per_embd == 4);
-@@ -240,9 +271,11 @@ int32_t mtmd_helper_decode_image_chunk(
+@@ -244,9 +244,11 @@ int32_t mtmd_helper_decode_image_chunk(
          llama_pos * new_n_past) {
      GGML_ASSERT(n_batch > 0);
      auto chunk_type = mtmd_input_chunk_get_type(chunk);
@@ -239,40 +201,27 @@ index 2f45dab..6793f2b 100644
          return -1;
      }
  
-@@ -265,6 +298,32 @@ int32_t mtmd_helper_decode_image_chunk(
-             const int nx = mtmd_image_tokens_get_nx(image_tokens);
-             const int ny = mtmd_image_tokens_get_ny(image_tokens);
-             batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
-+        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
-+            const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
-+            if (!image_tokens) {
-+                LOG_ERR("failed to decode chunk: video tokens are null\n");
-+                return -1;
-+            }
-+            const int nx = mtmd_image_tokens_get_nx(image_tokens);
-+            const int ny = mtmd_image_tokens_get_ny(image_tokens);
-+            const int nt = mtmd_image_tokens_get_nt(image_tokens);
-+
-+            // Use stored temporal positions if available, else fall back to sequential
-+            size_t n_tp = 0;
-+            const int32_t * stored_tp = mtmd_image_tokens_get_temporal_positions(
-+                image_tokens, &n_tp);
-+
-+            std::vector<int32_t> fallback_tp;
-+            const int32_t * tp = stored_tp;
-+            if (!tp || n_tp == 0) {
-+                fallback_tp.resize(nt);
-+                for (int t = 0; t < nt; t++) {
-+                    fallback_tp[t] = t;
-+                }
-+                tp = fallback_tp.data();
-+            }
-+
-+            batch_embd.set_position_mrope_3d(n_past, nx, ny, nt, tp, seq_id);
+@@ -260,14 +262,15 @@ int32_t mtmd_helper_decode_image_chunk(
+     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
+ 
+     if (mtmd_decode_use_mrope(ctx)) {
+-        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
++                || chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+             const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+             if (!image_tokens) {
+-                LOG_ERR("failed to decode chunk: image tokens are null\n");
++                LOG_ERR("failed to decode chunk: image/video tokens are null\n");
+                 return -1;
+             }
+-            const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
+-            std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
++            const auto n_tokens_view = mtmd_image_tokens_get_n_tokens(image_tokens);
++            std::vector<mtmd_decoder_pos> rel_pos(n_tokens_view);
+             mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
+             batch_embd.set_position_mrope_2d(rel_pos, seq_id);
          } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-             batch_embd.set_position_mrope_1d(n_past, seq_id);
-         } else {
-@@ -352,8 +411,12 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+@@ -357,8 +360,12 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
              *new_n_past += text_batch.n_tokens;
          }
  
@@ -288,32 +237,46 @@ index 2f45dab..6793f2b 100644
  
          LOG_INF("encoding %s slice...\n", name);
 diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
-index dc2bde1..7854673 100644
+index 5990778..bdb54ca 100644
 --- a/tools/mtmd/mtmd.cpp
 +++ b/tools/mtmd/mtmd.cpp
-@@ -36,8 +36,10 @@ struct mtmd_bitmap {
+@@ -38,19 +38,22 @@ enum mtmd_pos_type {
+     MTMD_POS_TYPE_NORMAL,    // number of positions equals to number of tokens
+     MTMD_POS_TYPE_MROPE,     // qwen-vl mrope style, each image takes max(t,h,w) position indexes
+     MTMD_POS_TYPE_HUNYUANVL, // HunyuanVL mrope + BOI/EOI/newline layout with XD-RoPE dim-3
++    MTMD_POS_TYPE_VIDEO,     // qwen-vl mrope style with per-super-frame temporal indices
+ };
+ 
  struct mtmd_image_tokens {
      uint32_t nx; // number of tokens in x direction
      uint32_t ny; // number of tokens in y direction
 +    uint32_t nt = 1; // number of temporal positions (1 for images, >1 for video)
-     bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
--    uint32_t n_tokens() const { return nx * ny; }
-+    std::vector<int32_t> temporal_positions; // M-RoPE temporal indices (one per temporal position)
-+    uint32_t n_tokens() const { return nx * ny * nt; }
+     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
+-    uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
++    uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt (used by pos == MTMD_POS_TYPE_HUNYUANVL)
++    std::vector<int32_t> temporal_positions; // per-super-frame temporal indices (used by pos == MTMD_POS_TYPE_VIDEO)
+     uint32_t n_tokens() const {
+         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
+             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
+             return (nx + 1) * ny + 2;
+         }
+-        return nx * ny;
++        return nx * ny * nt;
+     }
      clip_image_f32_batch batch_f32; // preprocessed image patches
      std::string id; // optional user-defined ID, useful for KV cache tracking
- 
-@@ -45,7 +47,9 @@ struct mtmd_image_tokens {
+@@ -59,8 +62,10 @@ struct mtmd_image_tokens {
          return mtmd_image_tokens{
              nx,
              ny,
 +            nt,
-             use_mrope_pos,
+             pos,
+             image_idx,
 +            temporal_positions,
              batch_f32.clone(),
              id
          };
-@@ -502,7 +506,8 @@ struct mtmd_context {
+@@ -549,7 +554,8 @@ struct mtmd_context {
  
      // get clip ctx based on chunk type
      clip_ctx * get_clip_ctx(const mtmd_input_chunk * chunk) const {
@@ -323,7 +286,7 @@ index dc2bde1..7854673 100644
              return ctx_v;
          } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
              return ctx_a;
-@@ -939,6 +944,195 @@ struct mtmd_tokenizer {
+@@ -995,6 +1001,193 @@ struct mtmd_tokenizer {
      }
  };
  
@@ -350,10 +313,8 @@ index dc2bde1..7854673 100644
 +        return 1;
 +    }
 +
-+    // Split text at media marker
++    // Split text at media marker (legacy image_marker is no longer accepted upstream).
 +    std::string input_text = text->text;
-+    // convert legacy image marker to media marker
-+    string_replace_all(input_text, MTMD_DEFAULT_IMAGE_MARKER, ctx->media_marker);
 +
 +    auto parts = mtmd_tokenizer::split_text(input_text, ctx->media_marker);
 +    size_t n_markers = 0;
@@ -430,8 +391,8 @@ index dc2bde1..7854673 100644
 +    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
 +    image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, video_batch.entries[0].get());
 +    image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, video_batch.entries[0].get());
-+    image_tokens->nt = n_superframes;
-+    image_tokens->use_mrope_pos = true;
++    image_tokens->nt  = n_superframes;
++    image_tokens->pos = MTMD_POS_TYPE_VIDEO;
 +    image_tokens->temporal_positions.assign(temporal_positions,
 +                                             temporal_positions + n_temporal_positions);
 +    image_tokens->batch_f32 = std::move(video_batch);
@@ -519,7 +480,7 @@ index dc2bde1..7854673 100644
  int32_t mtmd_tokenize(mtmd_context * ctx,
              mtmd_input_chunks * output,
              const mtmd_input_text * text,
-@@ -952,7 +1146,8 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+@@ -1008,7 +1201,8 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
      if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
          LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
          return 0;
@@ -529,7 +490,7 @@ index dc2bde1..7854673 100644
          if (!ctx->ctx_v) {
              LOG_ERR("%s: model does not support vision input\n", __func__);
              return 1;
-@@ -988,19 +1183,28 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens)
+@@ -1044,19 +1238,28 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens)
      ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
      bool ok = false;
  
@@ -563,7 +524,7 @@ index dc2bde1..7854673 100644
          }
      } else {
          ok = clip_image_batch_encode(
-@@ -1170,7 +1374,8 @@ const llama_token * mtmd_input_chunk_get_tokens_text(const mtmd_input_chunk * ch
+@@ -1213,7 +1416,8 @@ const llama_token * mtmd_input_chunk_get_tokens_text(const mtmd_input_chunk * ch
  }
  
  const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chunk * chunk) {
@@ -573,7 +534,7 @@ index dc2bde1..7854673 100644
          return chunk->tokens_image.get();
      }
      return nullptr;
-@@ -1179,7 +1384,8 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
+@@ -1222,7 +1426,8 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
  size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
      if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
          return chunk->tokens_text.size();
@@ -583,7 +544,7 @@ index dc2bde1..7854673 100644
          return mtmd_image_tokens_get_n_tokens(chunk->tokens_image.get());
      } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
          return chunk->tokens_audio->n_tokens;
-@@ -1191,7 +1397,8 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
+@@ -1234,7 +1439,8 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
  llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
      if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
          return chunk->tokens_text.size();
@@ -593,7 +554,7 @@ index dc2bde1..7854673 100644
          return mtmd_image_tokens_get_n_pos(chunk->tokens_image.get());
      } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
          return chunk->tokens_audio->n_tokens;
-@@ -1201,7 +1408,8 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
+@@ -1244,7 +1450,8 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
  }
  
  const char * mtmd_input_chunk_get_id(const mtmd_input_chunk * chunk) {
@@ -603,7 +564,7 @@ index dc2bde1..7854673 100644
          return chunk->tokens_image->id.c_str();
      } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
          return chunk->tokens_audio->id.c_str();
-@@ -1249,6 +1457,21 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
+@@ -1292,6 +1499,21 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
      return image_tokens->ny;
  }
  
@@ -622,24 +583,46 @@ index dc2bde1..7854673 100644
 +    return image_tokens->temporal_positions.data();
 +}
 +
- const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
-     return image_tokens->id.c_str();
- }
-@@ -1256,8 +1479,7 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
- llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
-     if (image_tokens->use_mrope_pos) {
-         // for M-RoPE, temporal dimension = max(t,h,w)
--        // t is omitted as we don't support video input
--        return std::max(image_tokens->nx, image_tokens->ny);
-+        return std::max({image_tokens->nt, image_tokens->nx, image_tokens->ny});
-     }
-     return image_tokens->n_tokens();
- }
+ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {
+     mtmd_decoder_pos pos;
+     switch (image_tokens->pos) {
+@@ -1302,6 +1524,20 @@ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * ima
+                 pos.y = pos_0 + (i / image_tokens->nx);
+                 pos.z = 0; // unused for now
+             } break;
++        case MTMD_POS_TYPE_VIDEO:
++            {
++                // tokens are laid out as nt super-frames, each of nx*ny tokens.
++                // each super-frame's temporal index comes from temporal_positions;
++                // spatial coords mirror the MROPE case within a frame.
++                const uint32_t per_frame = image_tokens->nx * image_tokens->ny;
++                const size_t   frame_idx = i / per_frame;
++                const size_t   in_frame  = i % per_frame;
++                const int32_t  t_offset  = image_tokens->temporal_positions[frame_idx];
++                pos.t = pos_0 + t_offset;
++                pos.x = pos_0 + (in_frame % image_tokens->nx);
++                pos.y = pos_0 + (in_frame / image_tokens->nx);
++                pos.z = 0;
++            } break;
+         case MTMD_POS_TYPE_NORMAL:
+             {
+                 pos.t = pos_0 + i;
+@@ -1355,6 +1591,10 @@ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
+     switch (image_tokens->pos) {
+         case MTMD_POS_TYPE_MROPE:
+             return std::max(image_tokens->nx, image_tokens->ny);
++        case MTMD_POS_TYPE_VIDEO:
++            // sequential dim advances by max({nt, nx, ny}); temporal_positions
++            // place each super-frame's temporal index within that span.
++            return std::max({image_tokens->nt, image_tokens->nx, image_tokens->ny});
+         case MTMD_POS_TYPE_NORMAL:
+             return image_tokens->n_tokens();
+         case MTMD_POS_TYPE_HUNYUANVL:
 diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
-index 2ecf956..9d12d4a 100644
+index e364174..b0c6892 100644
 --- a/tools/mtmd/mtmd.h
 +++ b/tools/mtmd/mtmd.h
-@@ -57,6 +57,7 @@ enum mtmd_input_chunk_type {
+@@ -54,6 +54,7 @@ enum mtmd_input_chunk_type {
      MTMD_INPUT_CHUNK_TYPE_TEXT,
      MTMD_INPUT_CHUNK_TYPE_IMAGE,
      MTMD_INPUT_CHUNK_TYPE_AUDIO,
@@ -647,10 +630,10 @@ index 2ecf956..9d12d4a 100644
  };
  
  // opaque types
-@@ -188,10 +189,33 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
+@@ -183,6 +184,12 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
+ // the instance will be constructed via mtmd_tokenize()
+ // it will be freed along with mtmd_input_chunk
  MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens); // TODO: deprecate
- MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
- MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
 +MTMD_API size_t       mtmd_image_tokens_get_nt      (const mtmd_image_tokens * image_tokens); // temporal positions (1 for images, >1 for video)
 +// get temporal positions array for video chunks (nullptr for images)
 +// n_positions will be set to the number of temporal positions
@@ -660,6 +643,9 @@ index 2ecf956..9d12d4a 100644
  MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
  // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
  MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
+@@ -204,6 +211,23 @@ struct mtmd_decoder_pos {
+ // return relative position (for example, embedding 0 will have position (0, 0, 0); remember to adjust it to the current absolute position)
+ MTMD_API struct mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i);
  
 +// tokenize a video prompt: pairs consecutive bitmaps into 6-channel super-frames
 +// and creates a single VIDEO chunk with temporal position encoding
@@ -682,10 +668,10 @@ index 2ecf956..9d12d4a 100644
  // the prompt must have the input image marker (default: "<__media__>") in it
  // the default marker is defined by mtmd_default_marker()
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index ed5e306..9815ce8 100644
+index 21c843c..4485e98 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
-@@ -341,7 +341,7 @@ void server_tokens::push_back(llama_token tok) {
+@@ -353,7 +353,7 @@ void server_tokens::push_back(llama_token tok) {
  
  void server_tokens::push_back(const mtmd_input_chunk * chunk) {
      auto type = mtmd_input_chunk_get_type(chunk);
@@ -694,7 +680,7 @@ index ed5e306..9815ce8 100644
          GGML_ASSERT(has_mtmd);
          const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
          size_t start_idx = tokens.size();
-@@ -517,8 +517,10 @@ int32_t server_tokens::process_chunk(
+@@ -539,8 +539,10 @@ int32_t server_tokens::process_chunk(
              int32_t seq_id,
              size_t & n_tokens_out) const {
      const auto & chunk = find_chunk(idx);
@@ -707,7 +693,7 @@ index ed5e306..9815ce8 100644
      SRV_INF("processing %s...\n", name);
      int32_t n_batch = llama_n_batch(ctx);
      int64_t t0 = ggml_time_ms();
-@@ -691,7 +693,7 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
+@@ -713,7 +715,7 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
      return std::to_string(hash);
  }
  
@@ -716,7 +702,7 @@ index ed5e306..9815ce8 100644
      mtmd::bitmaps bitmaps;
      for (auto & file : files) {
          mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
-@@ -713,13 +715,54 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
+@@ -735,13 +737,54 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
      };
      mtmd::input_chunks chunks(mtmd_input_chunks_init());
      auto bitmaps_c_ptr = bitmaps.c_ptr();
@@ -778,7 +764,7 @@ index ed5e306..9815ce8 100644
      }
      auto result = server_tokens(chunks, true);
      return result;
-@@ -1129,6 +1172,11 @@ json oaicompat_chat_params_parse(
+@@ -1155,6 +1198,11 @@ json oaicompat_chat_params_parse(
          throw std::invalid_argument("top_logprobs requires logprobs to be set to true");
      }
  
@@ -791,10 +777,10 @@ index ed5e306..9815ce8 100644
      // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
      // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
-index 213ae52..e73f444 100644
+index 4681f9c..98b1830 100644
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
-@@ -251,7 +251,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
+@@ -256,7 +256,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
  size_t validate_utf8(const std::string& text);
  
  // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
@@ -804,10 +790,10 @@ index 213ae52..e73f444 100644
  /**
   * break the input "prompt" object into multiple prompt if needed, then tokenize them
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b31981c..d2a5719 100644
+index 08ff1e3..bd0de46 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -3101,7 +3101,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -3195,7 +3195,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
          if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
              // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
