@@ -1,237 +1,261 @@
 # Debugging Guide
 
-This guide covers how to diagnose failures at every layer of the llama-video pipeline. When something goes wrong, work through these layers in order — most issues are in the outermost layers.
+Layer-by-layer diagnosis for the llama-video pipeline. Work from the outside in — most failures are in the outermost layers (ffmpeg, preprocessing) rather than the C patch.
 
-## Quick Diagnostic Checklist
+## Quick checklist
 
 ```
-□ Is ffmpeg installed and in PATH?          → ffmpeg -version
+□ Is ffmpeg installed and on PATH?          → ffmpeg -version
 □ Is llama-server running?                  → curl http://localhost:8080/health
-□ Is llama-server loaded with mmproj?       → Check server startup logs for "mmproj loaded"
-□ Is the patch applied?                     → Check server startup logs for "[video] temporal support enabled"
-□ Are frames extracting correctly?          → uv run llama-video-debug extract <video>
-□ Are super-frames shaped correctly?        → uv run llama-video-debug preprocess <video>
-□ Is the model responding to images?        → Test with a single image first
-□ Is temporal encoding active?              → Check debug output for grid_thw with T>1
+□ Is llama-server loaded with mmproj?       → check server startup logs for "mmproj loaded"
+□ Is the patch applied?                     → llama-video-debug validate-patch --server-url http://localhost:8080
+□ Are frames extracting correctly?          → llama-video-debug extract <video> --output-dir /tmp/f/
+□ Are super-frames shaped correctly?        → llama-video-debug preprocess <video>
+□ Is the model responding to images?        → test caption_image() first, then caption_video()
+□ Are temporal positions non-trivial?       → debug output should show grid_thw with T > 1
 ```
-
-## Layer 1: Frame Extraction (Python — Extractor)
-
-### Symptoms
-- "ffmpeg not found" error
-- Empty frame list returned
-- Frames are black, corrupted, or wrong resolution
-
-### Diagnostics
-```bash
-# Test ffmpeg directly
-ffmpeg -i test_video.mp4 -vf "fps=2" -q:v 2 /tmp/test_frames/frame_%04d.jpg
-
-# Use debug CLI
-uv run llama-video-debug extract test_video.mp4 --fps 2 --output-dir /tmp/debug_frames/
-
-# Check frame count vs expected
-# For a 4-second video at 2fps: expect 8 frames
-python -c "
-from llama_video import Extractor, ExtractorConfig
-e = Extractor(ExtractorConfig(fps=2.0))
-frames = e.extract_frames('test_video.mp4')
-print(f'Extracted {len(frames)} frames')
-for i, f in enumerate(frames):
-    print(f'  Frame {i}: {f.size}, mode={f.mode}')
-"
-```
-
-### Common Issues
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| ffmpeg not found | Not in PATH | Install ffmpeg or set `FFMPEG_PATH` |
-| 0 frames extracted | FPS too high for short video | Lower FPS or use `min_frames=1` |
-| Wrong resolution | Video has non-standard aspect ratio | Check `max_resolution` config |
-| Extraction hangs | Large video, no max_frames limit | Set `max_frames` config |
 
 ---
 
-## Layer 2: Video Preprocessing (Python — Preprocessor)
+## Layer 1 — Frame extraction (`extractor.py`)
 
 ### Symptoms
-- Super-frame has wrong number of channels (expected 6, got 3)
-- grid_thw values look wrong
-- Temporal positions are all zeros
+- `FFmpegNotFoundError`
+- `NoFramesError` (0 frames extracted)
+- Garbage pixel data; wrong resolution
 
 ### Diagnostics
-```bash
-# Debug preprocessor output
-uv run llama-video-debug preprocess test_video.mp4 --fps 2 --model qwen3.5
 
-# This prints:
-#   Frames: 8
-#   Super-frames: 4 (shape: [4, 6, H, W])
-#   grid_thw: [4, H/28, W/28]
-#   temporal_positions: [0, 1, 2, 3]
-#   Total vision tokens: 4 × (H/28) × (W/28)
+```bash
+# Sanity-check ffmpeg is reachable and the clip is decodable:
+ffmpeg -i test_video.mp4 -vf "fps=2" -q:v 2 /tmp/test_frames/frame_%04d.jpg
+
+# Extract via the debug CLI (writes frames to disk if --output-dir is given):
+llama-video-debug extract test_video.mp4 --fps 2 --output-dir /tmp/debug_frames/
+
+# From Python — note: Extractor() takes ExtractorSettings; per-call params go to ExtractorConfig:
+python -c "
+import asyncio
+from llama_video import Extractor, ExtractorConfig
+async def main():
+    e = Extractor()  # reads LLAMA_VIDEO_* env vars for defaults
+    frames = await e.extract_frames_async('test_video.mp4', ExtractorConfig(fps=2.0))
+    print(f'Extracted {len(frames)} frames')
+    for f in frames[:4]:
+        print(f'  Frame {f.index}: {f.size} at t={f.timestamp:.2f}s, data={f.data.shape} {f.data.dtype}')
+asyncio.run(main())
+"
+```
+
+`Frame` attributes: `data` (numpy `(H, W, 3)` uint8 RGB), `index`, `timestamp`, `width`, `height`, `size`.
+
+### Common issues
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| `FFmpegNotFoundError` | ffmpeg not on PATH | Install ffmpeg, or set `LLAMA_VIDEO_FFMPEG_PATH` |
+| `NoFramesError` (0 frames) | FPS × clip-length rounded to 0 | Lower FPS, or pass `min_frames=1` in `ExtractorConfig` |
+| `ExtractionTimeoutError` | Large video, slow disk, or hung ffmpeg | Raise `LLAMA_VIDEO_EXTRACTION_TIMEOUT`; reduce `max_frames` |
+| `VideoDecodeError` | Corrupt / unsupported codec | Re-encode with `ffmpeg -i in.mov -c:v libx264 out.mp4` |
+
+---
+
+## Layer 2 — Preprocessing (`preprocessor.py`)
+
+### Symptoms
+- Super-frame has 3 channels instead of 6
+- `grid_thw` looks wrong (e.g., `T=1` when you expect more)
+- `temporal_positions` all zero
+
+### Diagnostics
+
+```bash
+llama-video-debug preprocess test_video.mp4 --fps 2
+
+# Prints the count of super-frames, grid_thw, temporal_positions,
+# and the resolved pixel resolution.
 ```
 
 ```python
 # Manual inspection
-from llama_video import Preprocessor, ModelConfig
-p = Preprocessor(ModelConfig.qwen35())
-frames = [...]  # PIL Images
-result = p.process(frames)
-print(f"Super-frames: {len(result.super_frames)}")
-print(f"Grid THW: {result.grid_thw}")
-print(f"Temporal positions: {result.temporal_positions}")
-print(f"Super-frame shape: {result.super_frames[0].shape}")  # Should be (6, H, W)
+from llama_video import Extractor, ExtractorConfig, Preprocessor, ModelConfig
+import asyncio
+
+async def main():
+    frames = await Extractor().extract_frames_async("test_video.mp4", ExtractorConfig(fps=2.0))
+    result = Preprocessor(ModelConfig.qwen35()).process(frames, fps=2.0)
+
+    print(f"Super-frames: {len(result.super_frames)}")
+    print(f"Grid THW:     {result.grid_thw}")
+    print(f"Temporal pos: {result.temporal_positions}")
+    print(f"SF[0] shape:  {result.super_frames[0].shape}")  # expect (6, H, W) float32
+
+asyncio.run(main())
 ```
 
-### Common Issues
+### Expected temporal positions
+
+`Preprocessor.compute_temporal_positions(grid_thw, fps)` returns
+`[round(i * temporal_patch_size / fps) for i in range(T)]`.
+
+With defaults (`temporal_patch_size=2`, `fps=2.0`, T=4):
+
+```
+seconds_per_temporal = 2 / 2.0 = 1.0
+positions = [round(0*1), round(1*1), round(2*1), round(3*1)] = [0, 1, 2, 3]
+```
+
+If positions are all zero and T > 1 you have a bug — file an issue with the output of `llama-video-debug preprocess`.
+
+### Common issues
+
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| 3 channels instead of 6 | Frame pairing failed | Check `temporal_patch_size` config |
-| grid_thw T=1 | Not in video mode | Ensure `is_video=True` in preprocessing |
-| All temporal_positions = 0 | M-RoPE computation bypassed | Check model config has correct temporal params |
-| Odd frame count error | Can't pair last frame | Set `odd_frame_strategy='pad'` or `'drop'` |
+| SF has 3 channels not 6 | Pairing step bypassed | Verify `preprocessor.process()` was called; inspect `result.super_frames[0].shape` |
+| `grid_thw` has `T=1` | Too few frames extracted | Upstream in Layer 1: check `Extractor` actually returned ≥ 2 frames |
+| `temporal_positions` all zero | fps or `temporal_patch_size` mismatch | Check `Preprocessor(ModelConfig.qwen35()).process(frames, fps=...)` received a non-zero `fps` |
+| `InvalidFrameDimensionsError` | Mixed resolutions (shouldn't happen from ffmpeg) | All frames must share dimensions; re-extract |
+| `ResolutionError` | Resolved size outside `[min_pixels, max_pixels]` | Adjust `ModelConfig.max_pixels`, or downscale via `resolution_scale` arg |
 
-### Validation Against HuggingFace Reference
+### Cross-check against HuggingFace
+
+If you suspect a preprocessing discrepancy, compare our output with the HF reference processor (`tests/integration/test_hf_reference.py` does this end-to-end):
+
 ```python
-# Compare our preprocessor output with HuggingFace Qwen3-VL processor
 from transformers import AutoProcessor
 hf_proc = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
-
-# Process same video through both pipelines
-# Compare: grid_thw, pixel_values shape, temporal positions
-# They should match exactly
+# Run the same video through both; compare grid_thw and pixel values.
+# HF's image_grid_thw uses pre-merge dimensions (patch_size=14),
+# ours uses post-merge (grid_unit=28), so HF's H/W are 2× ours.
 ```
 
 ---
 
-## Layer 3: C Patch — Vision Encoder (clip.cpp)
+## Layer 3 — C patch, vision encoder (`clip.cpp` + `qwen3vl.cpp`)
 
 ### Symptoms
-- Segfault when processing video input
-- Garbage embeddings (all zeros, NaN, or constant values)
-- Correct embeddings for images but wrong for video
-- Dimension mismatch errors
+- Segfault or `GGML_ASSERT` when sending a video request
+- NaN / constant embeddings
+- Image requests work; video requests don't
 
 ### Diagnostics
 
-#### Enable Debug Logging
+#### Enable debug logging on `llama-server`
+
 ```bash
-# Start llama-server with debug logging
-LLAMA_LOG_LEVEL=debug ./llama.cpp/build/bin/llama-server \
+./llama.cpp/build/bin/llama-server \
     -m model.gguf --mmproj mmproj.gguf \
-    --host 0.0.0.0 --port 8080
+    --host 0.0.0.0 --port 8080 \
+    --verbose
 ```
 
-#### Key Log Lines to Look For
+The patch emits `LOG_DBG` lines from `mtmd_tokenize_video()` of the form:
+
 ```
-# Good — video mode activated:
-[mtmd] video input: T=4, H=16, W=16, channels=6
-[clip] conv3d decomposition: input_shape=[6,H,W] → conv2d_0=[3,H,W] + conv2d_1=[3,H,W]
-[clip] patch_embed output: [T*H*W, hidden_dim]
-[mtmd] mrope temporal positions: [0, 1, 2, 3]
-
-# Bad — fell through to image path:
-[mtmd] image input: channels=3, H=..., W=...
-# (This means the video flag isn't being passed through)
-
-# Bad — tensor shape mismatch:
-GGML_ASSERT: ne[0] == expected (got actual)
-# (Check tensor dimensions at the assertion point)
+mtmd_tokenize_video: video nx=16 ny=16 nt=4 n_tokens=1024
 ```
 
-#### GDB Debugging (Segfaults)
+Seeing this line confirms the video tokenize path ran. No such line = request never reached the video code path (look at the client request shape, especially `mm_processor_kwargs.is_video`).
+
+#### Under GDB (segfaults)
+
 ```bash
-# Build with debug symbols
-cd llama.cpp && cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build
+# Build with debug symbols:
+cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DGGML_CUDA=ON
+cmake --build build -j$(nproc)
 
-# Run under GDB
+# Run under GDB:
 gdb --args ./build/bin/llama-server -m model.gguf --mmproj mmproj.gguf
 (gdb) run
-# When it segfaults:
-(gdb) bt          # Backtrace
-(gdb) frame N     # Navigate to relevant frame
-(gdb) print shape # Inspect tensor shapes
+# When it crashes:
+(gdb) bt
+(gdb) frame N
+(gdb) print image_tokens->pos        # should be MTMD_POS_TYPE_VIDEO for video chunks
+(gdb) print image_tokens->nt         # number of super-frames
+(gdb) print image_tokens->nx, image_tokens->ny
 ```
 
-#### Tensor Shape Verification
-Expected shapes at each stage for a 4-second video at 2fps, 448×448 resolution:
+### Expected tensor shapes
+
+For a 4-second clip at 2 fps, 448×448 resolution:
+
 ```
-Input:           [4, 6, 448, 448]    (4 super-frames, 6 channels)
-After Conv3D:    [4, hidden, 32, 32] (patch_size=14, 448/14=32)
-After merge:     [4, hidden, 16, 16] (merge_size=2, 32/2=16)
-Vision tokens:   [4*16*16, hidden]   = [1024, hidden]
-After DeepStack: [1024, hidden]      (multi-layer features merged)
+Frames (Python):          8 × (448, 448, 3) uint8
+Super-frames (Python):    4 × (6, 448, 448) float32
+Super-frame nx × ny:      32 × 32 patches (448/14) → 16 × 16 after merge
+Per-frame vision tokens:  16 × 16 = 256
+Total video tokens:       nt × nx × ny = 4 × 16 × 16 = 1024
 ```
 
-### Common Issues
+### Common issues
+
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| Segfault in conv2d | Wrong tensor stride/dimensions | Check input tensor layout matches ggml expectations |
-| NaN embeddings | Division by zero in normalization | Check if any tensor values are zero when they shouldn't be |
-| Shape mismatch assertion | grid_thw not propagated | Verify video_grid_thw reaches clip_image_encode |
-| Image path used for video | is_video flag lost | Trace flag through mtmd → clip call chain |
+| Segfault in `Conv2D` | Wrong tensor stride / channels | Verify `batch_f32.is_video` and channel count (6, not 3) reaching `qwen3vl.cpp` |
+| NaN embeddings | Normalization divided by zero | Inspect `image_mean` / `image_std`; verify frame data isn't all-zero |
+| Image path used for video chunk | `MTMD_INPUT_CHUNK_TYPE_VIDEO` not set | Trace `mm_processor_kwargs.is_video` from client → server to tokenizer |
+| `GGML_ABORT("invalid position type")` | `image_tokens->pos` isn't one of the known enum values | Ensure `mtmd_tokenize_video()` ran and set `pos = MTMD_POS_TYPE_VIDEO` |
 
 ---
 
-## Layer 4: C Patch — Temporal M-RoPE (mtmd.cpp)
+## Layer 4 — C patch, temporal M-RoPE (`mtmd.cpp` + `mtmd-helper.cpp`)
 
 ### Symptoms
-- Video captions lack temporal awareness ("I see several images" instead of "A person walks, then sits down")
-- Same output for video mode vs multi-image mode (M-RoPE not differentiating)
-- Temporal positions not affecting output at all
+- Captions describe a montage instead of a continuous scene ("I see four images of…" rather than "a person walks, then sits")
+- Video-mode output identical to multi-image-mode output (temporal encoding ineffective)
 
 ### Diagnostics
 
-#### Temporal Differentiation Test
-```bash
-# This is the most important test for M-RoPE:
-# Send same frames as (a) multi-image and (b) video
-# If outputs are identical, M-RoPE temporal encoding is NOT working
+Check `mtmd_image_tokens_get_decoder_pos()` in `tools/mtmd/mtmd.cpp` for the `MTMD_POS_TYPE_VIDEO` case. For each of the `nx * ny * nt` tokens it returns:
 
-uv run llama-video-debug compare-modes test_video.mp4
-
-# Expected output:
-# Image mode response: "I see 4 photos showing a park scene..."
-# Video mode response: "In this video, a dog runs across the park and catches a frisbee..."
-# Cosine similarity of logits: 0.73  (should be < 0.95 if temporal encoding works)
+```cpp
+case MTMD_POS_TYPE_VIDEO: {
+    const uint32_t per_frame = image_tokens->nx * image_tokens->ny;
+    const size_t   frame_idx = i / per_frame;
+    const size_t   in_frame  = i % per_frame;
+    const int32_t  t_offset  = image_tokens->temporal_positions[frame_idx];
+    pos.t = pos_0 + t_offset;                                // differs per super-frame
+    pos.x = pos_0 + (in_frame % image_tokens->nx);
+    pos.y = pos_0 + (in_frame / image_tokens->nx);
+    pos.z = 0;
+} break;
 ```
 
-#### M-RoPE Position Inspection
-```python
-# Verify temporal positions are computed correctly
-from llama_video.preprocessor import compute_temporal_positions
+If video captions are identical to multi-image captions:
 
-grid_thw = (4, 16, 16)  # 4 temporal positions
-fps = 2.0
-positions = compute_temporal_positions(grid_thw, fps)
-# Expected: positions increment with temporal dimension
-# e.g., [0, 500, 1000, 1500] (scaled by tokens_per_second)
-print(positions)
-```
+1. Confirm `image_tokens->pos` is `MTMD_POS_TYPE_VIDEO`, not `MTMD_POS_TYPE_MROPE` (under GDB or via a `LOG_DBG` line you add).
+2. Confirm `temporal_positions` is not all zeros — `llama-video-debug preprocess` prints the Python-side values.
+3. Confirm the client is sending `mm_processor_kwargs.is_video: true`:
 
-### Common Issues
+   ```bash
+   curl http://localhost:9000/v1/debug/last-request | python -m json.tool
+   ```
+
+### Common issues
+
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| No temporal differentiation | temporal_idx always 0 | Check M-RoPE code path for video vs image branching |
-| Wrong temporal scale | tokens_per_second misconfigured | Compare with HF reference implementation |
-| Interleaved layout wrong | Qwen3.5 vs Qwen3-VL difference | Qwen3.5 uses interleaved; check layout order |
+| Temporal dimension collapses | All `temporal_positions[i]` equal | Fix Python side (Layer 2) |
+| Spatial positions wrong | `nx` / `ny` swapped somewhere | Cross-check `clip_n_output_tokens_x` / `y` on the vision batch |
+| Captions list frames instead of narrate | Patch not active | `llama-video-debug validate-patch` |
 
 ---
 
-## Layer 5: API Server (Python — Server/Client)
+## Layer 5 — HTTP service + client (`server.py` + `client.py`)
 
 ### Symptoms
-- 500 error on `/v1/caption`
-- Timeout waiting for response
-- Caption is empty or "I cannot process video"
+- `POST /v1/caption` returns 500
+- Timeout
+- Empty caption / "I cannot process video"
 
 ### Diagnostics
+
 ```bash
-# Health check
+# Service health + llama-server reachability
 curl http://localhost:9000/v1/health | python -m json.tool
 
-# Manual caption request with verbose output
+# Caption request with a known-good video
 curl -X POST http://localhost:9000/v1/caption \
   -H "Content-Type: application/json" \
   -d '{
@@ -240,75 +264,72 @@ curl -X POST http://localhost:9000/v1/caption \
     "fps": 2.0
   }' | python -m json.tool
 
-# Check last request debug info
+# Inspect the most recent request (frame count, SF shapes, grid_thw, per-stage timings)
 curl http://localhost:9000/v1/debug/last-request | python -m json.tool
-# Returns: frame count, super-frame shapes, grid_thw, timing, llama-server request/response
 ```
 
 ### Logging
-```bash
-# Run server with debug logging
-LLAMA_VIDEO_LOG_LEVEL=DEBUG uv run llama-video-server
 
-# Log output includes:
-# [extractor] Extracting frames from /path/to/video.mp4 at 2.0 fps
-# [extractor] Extracted 8 frames in 0.3s
-# [preprocessor] Built 4 super-frames, grid_thw=[4, 16, 16]
-# [client] Sending to llama-server: 4 images, is_video=true
-# [client] Response received in 2.1s, 47 tokens
+```bash
+LLAMA_VIDEO_LOG_LEVEL=DEBUG llama-video-server
 ```
+
+Log format: `%(asctime)s [%(name)s] %(levelname)s: %(message)s`. Expect lines from `llama_video.server`, `llama_video.extractor`, `llama_video.preprocessor`, and `llama_video.client` modules during a request.
+
+### Request shape reaching llama-server
+
+The client POSTs a standard OpenAI `chat/completions` payload with an additional `mm_processor_kwargs` block (this is the video-mode signal):
+
+```json
+{
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+      "... (one image_url per FRAME — each super-frame decomposes into 2)",
+      {"type": "text", "text": "Describe what happens in this video."}
+    ]
+  }],
+  "max_tokens": 2048,
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "min_p": 0.0,
+  "presence_penalty": 1.5,
+  "cache_prompt": true,
+  "mm_processor_kwargs": {
+    "fps": 2.0,
+    "is_video": true,
+    "grid_thw": [4, 16, 16],
+    "temporal_positions": [0, 1, 2, 3]
+  }
+}
+```
+
+The patch's server-side code reads `mm_processor_kwargs` and drives the video chunk construction on the server. Without `is_video: true`, the server falls back to treating each frame as an independent image.
+
+### Common issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 422 from `/v1/caption` | Validation (extraction or preprocessing error); body includes the diagnostic | Check `ExtractionError` / `PreprocessingError` message |
+| 502 from `/v1/caption` | `llama-server` unreachable or errored | Verify `LLAMA_SERVER_URL`; check server logs |
+| 503 from llama-server | Model not loaded | Verify `--mmproj` and `-m` paths on the server command line |
+| Caption says "I see 4 images" | Patch off / `is_video` not reaching server | Run `validate-patch`; verify `curl /v1/debug/last-request` shows `"is_video": true` |
 
 ---
 
-## Layer 6: Integration with Intern
+## Debug CLI reference
 
-### Symptoms
-- Intern video editor sends clip but gets no response
-- Caption appears but lacks temporal content
-- Connection refused errors
-
-### Diagnostics
-```bash
-# Verify llama-video service is running
-curl http://localhost:9000/v1/health
-
-# Verify Intern backend can reach it
-# (from Intern's backend container/environment)
-curl http://localhost:9000/v1/caption -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"video_path": "/tmp/test.mp4", "prompt": "Describe this video."}'
+```
+llama-video-debug extract   <video> [--fps N] [--max-frames N] [--output-dir DIR]
+llama-video-debug preprocess <video> [--fps N] [--max-frames N] [--model PROFILE]
+llama-video-debug validate-patch [--server-url URL]
 ```
 
----
+Only these three subcommands exist. `--help` on any subcommand prints its flags.
 
-## Debug CLI Reference
+## Environment variables
 
-The `llama-video-debug` CLI provides diagnostic tools:
-
-```bash
-# Extract and inspect frames
-uv run llama-video-debug extract <video> [--fps N] [--output-dir DIR]
-
-# Preprocess and inspect super-frames
-uv run llama-video-debug preprocess <video> [--fps N] [--model qwen3.5]
-
-# Compare image-mode vs video-mode output
-uv run llama-video-debug compare-modes <video> [--server-url URL]
-
-# Full pipeline trace with timing
-uv run llama-video-debug trace <video> [--prompt TEXT] [--server-url URL]
-
-# Validate patch is working
-uv run llama-video-debug validate-patch [--server-url URL]
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LLAMA_VIDEO_LOG_LEVEL` | `INFO` | Python logging level |
-| `LLAMA_SERVER_URL` | `http://localhost:8080` | Patched llama-server URL |
-| `FFMPEG_PATH` | `ffmpeg` | Path to ffmpeg binary |
-| `LLAMA_VIDEO_MAX_FRAMES` | `64` | Maximum frames to extract |
-| `LLAMA_VIDEO_DEFAULT_FPS` | `2.0` | Default frame extraction FPS |
-| `LLAMA_VIDEO_DEBUG` | `0` | Set to 1 for verbose debug output |
+See the [main README's environment-variable table](../README.md#environment-variables) for the full list.

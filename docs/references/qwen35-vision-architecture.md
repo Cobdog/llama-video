@@ -1,160 +1,143 @@
 # Qwen3.5 Vision Encoder Architecture
 
-> **Source:** HuggingFace model cards, Qwen3-VL technical report, llama.cpp Issue #17660
-> **Last verified:** 2026-03-23
+> **Source:** HuggingFace model cards, Qwen3-VL technical notes, llama.cpp `tools/mtmd/models/qwen3vl.cpp`
+> **Last verified:** 2026-04-24 (against llama.cpp master `0adede8`)
 
-## Model Family
+Reference notes for what the vision encoder does and what our patch has to match. Claims here are kept to what we can verify from code we can read — the Qwen3.5 HuggingFace reference processor and llama.cpp's `tools/mtmd/models/qwen3vl.cpp`. Size-specific numbers (parameter counts, MoE configs) are in the [main README](../../README.md#supported-models) and not duplicated here.
 
-All Qwen3.5 models share the same vision encoder architecture. The LLM backbone differs in size, but the vision path is identical:
+## Vision encoder: shared across sizes
 
-| Model | Total Params | Active Params | MoE | Vision Encoder |
-|-------|-------------|---------------|-----|----------------|
-| Qwen3.5-0.8B | 0.8B | 0.8B | No | Shared ViT |
-| Qwen3.5-2B | 2B | 2B | No | Shared ViT |
-| Qwen3.5-4B | 4B | 4B | No | Shared ViT |
-| Qwen3.5-9B (Flash) | 9B | 9B | No | Shared ViT |
-| Qwen3.5-27B | 27B | 27B | No | Shared ViT |
-| **Qwen3.5-35B-A3B** | **35B** | **3B** | **Yes** | **Shared ViT** |
-| **Qwen3.5-122B-A10B** | **122B** | **10B** | **Yes** | **Shared ViT** |
-| Qwen3.5-397B-A17B | 397B | 17B | Yes | Shared ViT |
+All Qwen3.5 VL models share the same vision encoder. The LLM backbone differs per size (dense vs. MoE, active params, hidden size), but the vision path — Conv3D patch embed, ViT, DeepStack, merge, projection — is identical. One mmproj per size, but the encoder logic our patch hooks into is the same.
 
-## Vision Encoder: DeepStack ViT
+## Patch embedding (Conv3D)
 
-### Patch Embedding (Conv3D)
-- **Spatial patch size:** 14×14 pixels
-- **Temporal patch size:** 2 frames
-- **Conv3D kernel:** (2, 14, 14) — processes 2 frames simultaneously
-- **Input for images:** (1, 3, H, W) → temporal dim is 1, Conv3D degrades to Conv2D
-- **Input for video:** (T, 3, H, W) → frames paired into (T/2, 6, H, W) super-frames
+| Parameter | Value |
+|-----------|-------|
+| Spatial patch size | 14 × 14 pixels |
+| Temporal patch size | 2 frames |
+| Conv3D kernel | `(2, 14, 14)` |
+| Input for **images** | `(1, 3, H, W)` → temporal dim is 1, Conv3D degrades to Conv2D |
+| Input for **video** | `(T/2, 6, H, W)` super-frames, 2 source frames concatenated on the channel axis |
 
-### Conv3D Operation
+### Conv3D decomposition (what our patch rides)
+
 ```
-Input: [batch, 6, H, W]  (super-frame: 2 RGB frames concatenated on channel dim)
+Input: (batch, 6, H, W)   # super-frame: 2 RGB frames concatenated on channel dim
 
-Conv3D(in_channels=3, out_channels=hidden, kernel_size=(2, 14, 14)):
-  - Slice weight into temporal_0 and temporal_1 (each [hidden, 3, 14, 14])
-  - frame_0 = input[:, 0:3, :, :]   (first 3 channels)
-  - frame_1 = input[:, 3:6, :, :]   (last 3 channels)
-  - output = Conv2D(frame_0, temporal_0) + Conv2D(frame_1, temporal_1)
+Conv3D(in=3, out=hidden, kernel=(2, 14, 14)):
+  - Split weight along temporal dim → weight_t0, weight_t1 (each (hidden, 3, 14, 14))
+  - frame_a = input[:, 0:3, :, :]
+  - frame_b = input[:, 3:6, :, :]
+  - output  = Conv2D(frame_a, weight_t0) + Conv2D(frame_b, weight_t1)
 
-Output: [batch, hidden, H/14, W/14]
+Output: (batch, hidden, H/14, W/14)
 ```
 
-### DeepStack
-Unlike standard ViTs that use only the last layer's output:
-- DeepStack extracts features from **multiple intermediate ViT layers**
-- These are merged/weighted before projection to LLM dimension
-- The mmproj GGUF file contains the DeepStack configuration
-- **No patch changes needed** — DeepStack is handled inside the mmproj
+llama.cpp already implements this decomposition for images (where `frame_b` is either absent or zeroed). Our patch feeds it 6-channel input and sets `clip_image_f32_batch.is_video = true` so the qwen3vl model path takes the two-Conv2D sum branch.
 
-### Merge Operation
-After patch embedding, spatial tokens are further merged:
-- **merge_size:** 2 (merges 2×2 spatial tokens into 1)
-- Reduces token count by 4×
-- For 448×448 input: 448/14 = 32 patches → 32/2 = 16 merged → 256 tokens per temporal position
+## DeepStack
 
-## M-RoPE (Multimodal Rotary Position Embeddings)
+Unlike a vanilla ViT that uses only the last layer's output, DeepStack extracts features from several intermediate layers and merges them before projection to the LLM hidden dimension. The configuration (which layer indices to pull from, merge weights) lives in the **mmproj GGUF** — not in code we ship. No patch changes needed for DeepStack support.
 
-### Structure
-Each position has 3 components mapped to RoPE dimensions:
+## Spatial merge
+
+After patch embedding, spatial tokens are merged 2×2:
+
+- `merge_size = 2` → reduces token count by 4×
+- Example: 448×448 input → 32×32 patches (pre-merge) → 16×16 tokens (post-merge) → 256 vision tokens per super-frame
+
+Our `grid_thw` uses the **post-merge** dimensions. HF's `image_grid_thw` uses **pre-merge**. See [`preprocessing.md`](../subsystems/preprocessing.md#grid-thw) for why.
+
+## M-RoPE positions
+
+M-RoPE splits the RoPE dimensions into groups: temporal, height, width (plus a reserved fourth group used by HunyuanVL). Each vision token gets a `(t, x, y, z)` tuple that the attention layers use in place of a scalar position.
+
+### Image path (unchanged by our patch)
+
 ```
-RoPE dimensions split into 3 groups:
-  - Group 1: temporal position (or text position for text tokens)
-  - Group 2: height position
-  - Group 3: width position
-```
-
-### For Images (current llama.cpp behavior)
-```
-temporal_pos = 0  (constant for all patches in an image)
-height_pos   = row_index  (0 to H_grid-1)
-width_pos    = col_index  (0 to W_grid-1)
+t = pos_0           # same for every token in the image
+x = pos_0 + col_in_grid
+y = pos_0 + row_in_grid
+z = 0
 ```
 
-### For Video (what our patch adds)
+### Video path (added by our patch)
+
 ```
-temporal_pos = round(frame_idx × seconds_per_grid × tokens_per_second)
-height_pos   = row_index  (0 to H_grid-1)
-width_pos    = col_index  (0 to W_grid-1)
-```
+per_frame = nx * ny
+frame_idx = token_i // per_frame           # which super-frame this token belongs to
+in_frame  = token_i %  per_frame           # token's offset within its frame
 
-Where:
-- `frame_idx` = temporal grid position (0 to T-1, where T = num_frames / temporal_patch_size)
-- `seconds_per_grid` = temporal_patch_size / fps
-- `tokens_per_second` = model config value (controls temporal resolution)
-
-### Interleaved Layout (Qwen3.5 Upgrade)
-Qwen3.5 uses **interleaved** M-RoPE layout (different from Qwen3-VL's sequential layout):
-```
-# Qwen3-VL (sequential):  [t,t,t,..., h,h,h,..., w,w,w,...]
-# Qwen3.5 (interleaved):  [t,h,w, t,h,w, t,h,w, ...]
-```
-This is critical — using the wrong layout produces garbage outputs.
-
-## Video Processing Pipeline (HuggingFace Reference)
-
-```python
-# From transformers Qwen3VLImageProcessor
-def process_video(video_path, fps=2.0):
-    # 1. Sample frames at specified FPS
-    frames = sample_frames(video_path, fps=fps, do_sample_frames=True)
-
-    # 2. Resize frames
-    # Default: shortest_edge=4096, longest_edge=469762048
-    # For practical use: bounded by max_pixels
-    frames = [resize(f, min_pixels, max_pixels) for f in frames]
-
-    # 3. Pair frames (temporal_patch_size=2)
-    # [F0, F1, F2, F3] → [(F0,F1), (F2,F3)]
-    # Each pair concatenated on channel dim: 3+3=6 channels
-
-    # 4. Compute grid_thw
-    T = len(frames) // temporal_patch_size  # number of temporal positions
-    H = frame_height // (patch_size * merge_size)  # merged height grid
-    W = frame_width // (patch_size * merge_size)    # merged width grid
-    grid_thw = [T, H, W]
-
-    # 5. Apply to model
-    # pixel_values_videos: [T, 6, H, W] float tensor
-    # video_grid_thw: [1, 3] long tensor ([T, H, W])
-    return pixel_values_videos, video_grid_thw
+t = pos_0 + temporal_positions[frame_idx]  # each super-frame has its own temporal index
+x = pos_0 + (in_frame %  nx)
+y = pos_0 + (in_frame // nx)
+z = 0
 ```
 
-## Configuration Files in GGUF
+Where `temporal_positions[i]` is computed in Python as `round(i * temporal_patch_size / fps)` — see [`preprocessing.md`](../subsystems/preprocessing.md#temporal-m-rope-positions).
 
-The mmproj GGUF contains vision encoder config. Key fields:
+### Position-array layout
+
+llama.cpp writes the `(t, y, x, z)` tuples into the batch as **slabs** of length `n_tokens`, not interleaved per token. The helper `set_position_mrope_2d(rel_pos, seq_id)` does:
+
+```cpp
+pos[i                  ] = rel_pos[i].t;
+pos[i + n_tokens       ] = rel_pos[i].y;
+pos[i + n_tokens * 2   ] = rel_pos[i].x;
+pos[i + n_tokens * 3   ] = rel_pos[i].z;
+```
+
+So the four dimensions live in four contiguous blocks. This is an implementation detail of llama.cpp, not a property of M-RoPE; the mathematical attention computation is the same either way.
+
+## Token budget
+
+```
+vision_tokens = T × H_post × W_post
+              = T × (H_pixels / 28) × (W_pixels / 28)
+```
+
+Example — 10-second clip at 2 fps, 448×448:
+
+| Quantity | Value |
+|----------|-------|
+| Frames extracted | 20 |
+| Super-frames (T) | 10 |
+| Pre-merge patches/frame | 32² = 1024 |
+| Post-merge tokens/frame | 16² = 256 |
+| Total vision tokens | 10 × 256 = 2,560 |
+
+This fits comfortably within a 65K context.
+
+## mmproj GGUF metadata
+
+The mmproj GGUF carries vision encoder config in its metadata:
+
 - `vision.patch_size` = 14
 - `vision.temporal_patch_size` = 2
 - `vision.merge_size` = 2
-- `vision.hidden_size` = varies by model
-- `vision.num_hidden_layers` = varies
-- `vision.deepstack_layers` = list of layer indices for DeepStack
+- `vision.hidden_size` — varies
+- `vision.num_hidden_layers` — varies
+- `vision.deepstack_layers` — list of layer indices merged by DeepStack
 
-## Token Budget
+Our patch doesn't read these — it relies on llama.cpp's existing mmproj loader.
 
-For a video with T temporal positions, H height grid, W width grid:
-```
-vision_tokens = T × H × W
-```
+## Defaults our implementation uses
 
-Example: 10-second video at 2fps, 448×448:
-- Frames: 20
-- Super-frames: 10 (T=10)
-- Patches per frame: (448/14)² = 1024
-- After merge: (448/28)² = 256
-- Total vision tokens: 10 × 256 = 2,560 tokens
-
-This fits easily within the 262K context window.
-
-## Key Parameters for Our Implementation
+From `src/llama_video/config.py::ModelConfig.qwen35()`:
 
 ```python
-# Default model config for all Qwen3.5 models
-TEMPORAL_PATCH_SIZE = 2
-SPATIAL_PATCH_SIZE = 14
-MERGE_SIZE = 2
-DEFAULT_VIDEO_FPS = 2.0
-DEFAULT_MAX_FRAMES = 64  # Conservative default
-MIN_PIXELS = 4 * 28 * 28      # Minimum frame size
-MAX_PIXELS = 16384 * 28 * 28  # Maximum frame size
+temporal_patch_size = 2
+spatial_patch_size  = 14
+merge_size          = 2
+min_pixels          = 3_136          # 4   * 28^2
+max_pixels          = 12_845_056     # 16384 * 28^2
+image_mean          = (0.48145466, 0.4578275, 0.40821073)
+image_std           = (0.26862954, 0.26130258, 0.27577711)
+```
+
+Defaults for extraction (`ExtractorSettings` / `ExtractorConfig`):
+
+```python
+default_fps = 2.0
+max_frames  = 64
 ```

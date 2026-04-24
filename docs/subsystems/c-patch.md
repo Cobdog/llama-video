@@ -77,8 +77,8 @@ Reading the rebased patch as an architectural overview:
 # 3. Video smoke test (Python harness against llama-server):
 uv run pytest tests/smoke/test_video_caption.py -v
 
-# 4. Validate temporal encoding
-uv run llama-video-debug compare-modes test_video.mp4
+# 4. Confirm the patch is active on the running server
+uv run llama-video-debug validate-patch --server-url http://localhost:8080
 ```
 
 ## Rebasing on Upstream
