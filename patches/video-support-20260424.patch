@@ -668,7 +668,7 @@ index e364174..b0c6892 100644
  // the prompt must have the input image marker (default: "<__media__>") in it
  // the default marker is defined by mtmd_default_marker()
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 21c843c..4485e98 100644
+index 21c843c..19321a0 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -353,7 +353,7 @@ void server_tokens::push_back(llama_token tok) {
@@ -702,7 +702,7 @@ index 21c843c..4485e98 100644
      mtmd::bitmaps bitmaps;
      for (auto & file : files) {
          mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
-@@ -735,13 +737,54 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
+@@ -735,13 +737,57 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
      };
      mtmd::input_chunks chunks(mtmd_input_chunks_init());
      auto bitmaps_c_ptr = bitmaps.c_ptr();
@@ -720,7 +720,10 @@ index 21c843c..4485e98 100644
 +    if (is_video) {
 +        // In video mode, multiple image_url entries each created a media marker.
 +        // Collapse all markers into a single one for mtmd_tokenize_video.
-+        std::string marker = mtmd_default_marker();
++        // Use get_media_marker() — the actual (per-server, randomized) marker
++        // the server substituted into the prompt — not mtmd_default_marker(),
++        // which is the hardcoded default and won't match on a live server.
++        std::string marker = get_media_marker();
 +        size_t first_pos = prompt.find(marker);
 +        if (first_pos != std::string::npos) {
 +            size_t pos = first_pos + marker.size();
@@ -764,7 +767,7 @@ index 21c843c..4485e98 100644
      }
      auto result = server_tokens(chunks, true);
      return result;
-@@ -1155,6 +1198,11 @@ json oaicompat_chat_params_parse(
+@@ -1155,6 +1201,11 @@ json oaicompat_chat_params_parse(
          throw std::invalid_argument("top_logprobs requires logprobs to be set to true");
      }
  
