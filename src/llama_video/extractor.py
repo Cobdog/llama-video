@@ -83,7 +83,9 @@ class Extractor:
     async def _get_video_info(self, video_path: Path) -> tuple[int, int, float]:
         """Get video dimensions and duration using ffprobe."""
         cmd = [
-            self.ffmpeg_path.replace("ffmpeg", "ffprobe"),
+            str(Path(self.ffmpeg_path).with_name(
+                Path(self.ffmpeg_path).name.replace("ffmpeg", "ffprobe")
+            )),
             "-v",
             "error",
             "-select_streams",
