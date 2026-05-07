@@ -109,6 +109,7 @@ class QwenAdapter(ModelAdapter):
         odd_strategy: OddFrameStrategy = OddFrameStrategy.PAD,
     ) -> list[SuperFrame]:
         working = list(frames)
+        assert self._config.temporal_patch_size == 2, "Only temporal_patch_size=2 is supported"
         if len(working) % self._config.temporal_patch_size != 0:
             if odd_strategy == OddFrameStrategy.PAD:
                 working.append(working[-1])
@@ -234,6 +235,32 @@ class QwenAdapter(ModelAdapter):
                 "grid_thw": list(video_input.grid_thw),
                 "temporal_positions": video_input.temporal_positions,
             },
+        }
+        if model_name:
+            payload["model"] = model_name
+        return payload
+
+    # ── Image payload construction ─────────────────────────────────
+
+    def build_image_payload(
+        self,
+        image_message: dict[str, Any],
+        prompt: str,
+        max_tokens: int = 2048,
+        preset: AdapterPreset | None = None,
+        cache_prompt: bool = True,
+        model_name: str = "",
+    ) -> dict[str, Any]:
+        p = preset or self.default_preset
+        payload: dict[str, Any] = {
+            "messages": [_SYSTEM_MESSAGE, image_message],
+            "max_tokens": max_tokens,
+            "temperature": p.temperature,
+            "top_p": p.top_p,
+            "top_k": p.top_k,
+            "min_p": p.min_p,
+            "presence_penalty": p.presence_penalty,
+            "cache_prompt": cache_prompt,
         }
         if model_name:
             payload["model"] = model_name

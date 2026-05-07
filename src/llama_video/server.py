@@ -28,6 +28,8 @@ from llama_video.types import (
 logger = logging.getLogger(__name__)
 
 # Module-level state (set during lifespan)
+# NOTE: _last_debug is overwritten on every caption request. Under concurrent
+# load, /v1/debug/last-request may return a different request's debug info.
 _settings: Settings | None = None
 _extractor: Extractor | None = None
 _client: LlamaServerClient | None = None

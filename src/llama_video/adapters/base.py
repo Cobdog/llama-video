@@ -94,6 +94,36 @@ class ModelAdapter(ABC):
             Complete payload dict for /v1/chat/completions.
         """
 
+    def build_image_payload(
+        self,
+        image_message: dict[str, Any],
+        prompt: str,
+        max_tokens: int = 2048,
+        preset: AdapterPreset | None = None,
+        cache_prompt: bool = True,
+        model_name: str = "",
+    ) -> dict[str, Any]:
+        """Build the OpenAI-compatible request payload for a single image.
+
+        Default implementation constructs a standard image payload with the
+        adapter's system message and sampler params. Override for model-specific
+        image payload requirements.
+
+        Args:
+            image_message: Pre-built user message dict with image content.
+            prompt: User caption prompt (included in image_message).
+            max_tokens: Max generation tokens.
+            preset: Inference preset (uses default if None).
+            cache_prompt: Whether to enable prompt caching.
+            model_name: Model name for router mode (empty = single-model).
+
+        Returns:
+            Complete payload dict for /v1/chat/completions.
+        """
+        raise NotImplementedError(
+            f"Adapter '{self.name}' does not implement build_image_payload"
+        )
+
     @abstractmethod
     def parse_response(self, raw: str) -> tuple[str, str, bool]:
         """Parse model response into (caption, thinking, truncated).

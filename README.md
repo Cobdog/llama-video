@@ -61,7 +61,7 @@ Two model families are currently supported via the adapter system. Each adapter 
 | Model family | Patch required | Notes |
 |-------------|---------------|-------|
 | **Qwen3.5** (all sizes) | Yes | 6-channel super-frames, temporal M-RoPE via C patch |
-| **Gemma4** (27B, 31B) | No | Works with stock llama.cpp; native video support |
+| **Gemma4** (31B) | No | Works with stock llama.cpp; native video support (max 60s @ 1 FPS) |
 
 ### Qwen3.5 models
 
@@ -77,12 +77,14 @@ All Qwen3.5 vision models share the same vision encoder (`temporal_patch_size=2`
 
 ### Gemma4 models
 
-Gemma4 models process video frames natively through llama.cpp's multimodal pipeline — no super-frame patching needed. Each frame is sent as a standard `image_url` with integer timestamps.
+Google's Gemma 4 supports video natively through llama.cpp's multimodal pipeline — no super-frame patching needed. Frames are sent individually with MM:SS timestamps. Video is supported up to 60 seconds at 1 FPS. The 31B dense model is recommended for captioning; smaller variants (E2B, E4B, 26B-A4B MoE) also support images but have not been tested for video captioning.
 
-| Model | Params | Notes |
-|-------|--------|-------|
-| Gemma4-27B | 27B | Good quality/VRAM balance |
-| MM-Sprinkle-Gemma4-31B | 31B | Community fine-tune with strong video understanding |
+| Model | Total / active params | Notes |
+|-------|----------------------|-------|
+| Gemma 4 31B IT | 30.7B (dense) | Best quality for captioning; 256K context |
+| Gemma 4 26B IT | 25.2B / 3.8B active (MoE) | MoE — lower VRAM, fast |
+| Gemma 4 E4B IT | 8B / 4.5B (dense) | Lightweight |
+| Gemma 4 E2B IT | 5.1B / 2.3B (dense) | Smallest |
 
 Each model requires **two files**: the GGUF model and the mmproj (vision projector) GGUF.
 
@@ -221,10 +223,10 @@ Grab the GGUF model **and** its mmproj from HuggingFace. Examples:
 - `mmproj-Qwen3.5-35B-A3B-F16.gguf` — vision projector
 
 **Gemma4** (works with stock llama.cpp, no patch needed):
-- `MM-Sprinkle-Gemma4-31B-Q4_K_M.gguf` — quantized model
-- `mmproj-MM-Sprinkle-Gemma4-31B-F16.gguf` — vision projector
+- `gemma-4-31B-it-Q4_K_M.gguf` — quantized weights (~19.6 GB)
+- `mmproj-gemma-4-31B-it-f32.gguf` — vision projector
 
-Any community quant works; the mmproj must match the model family.
+GGUF files are available from community providers like [bartowski](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF) and [unsloth](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF). The mmproj is separate — find it under the same provider or from [ddh0](https://huggingface.co/ddh0/gemma-4-it-GGUF). Any community quant works; the mmproj must match the model family.
 
 ### 5. Start llama-server
 
@@ -431,7 +433,7 @@ Every `Settings` field can be overridden with an env var. Prefixes:
 
 ### Inference presets
 
-Two built-in presets (based on official Qwen team recommendations; adapters pass these through to the sampler):
+Two built-in presets (based on official Qwen team recommendations; adapters pass these through to the sampler). When no adapter profile is specified, `get_adapter()` defaults to `qwen3.5`.
 
 | Preset | Temperature | Top P | Top K | Min P | Presence penalty | Use case |
 |--------|-------------|-------|-------|-------|------------------|----------|

@@ -13,7 +13,7 @@ Decompose llama-video's hardcoded Qwen3.5 video pipeline into a `ModelAdapter` i
 - A new `GemmaAdapter` can be registered and selected via `model_profile`
 - Adding a future model family requires implementing one class, no core changes
 - The public API surface (`/v1/caption`, CLI, Python API) is backward-compatible
-- The WebUI allows manual profile selection OR auto-detection from llama-server
+- The WebUI allows manual profile selection (auto-detection deferred to roadmap)
 - Each adapter has fully isolated sampler and token budget settings
 
 ## Tech Stack
@@ -52,8 +52,8 @@ uv run pytest tests/unit/ tests/integration/ -v --tb=short
 ```
 src/llama_video/
   adapters/               → NEW: adapter package
-    __init__.py           → Registry + get_adapter() factory + auto-detect
-    base.py               → Abstract ModelAdapter class + AdapterConfig
+    __init__.py           → Registry + get_adapter() factory
+    base.py               → Abstract ModelAdapter class + AdapterPreset
     qwen.py               → Qwen3.5 adapter (extracted from current code)
     gemma.py              → Gemma4 adapter (new)
   config.py               → Modified: ModelConfig becomes family-aware
@@ -64,7 +64,7 @@ src/llama_video/
   tokens.py               → Modified: per-adapter token estimation
   types.py                → Modified: family-agnostic types
   server.py               → Minimal change: adapter selection in pipeline
-  webui.py                → Modified: profile selector + auto-detect toggle
+  webui.py                → Modified: profile selector
   ...
 
 tests/
@@ -93,12 +93,6 @@ Follow existing project conventions (ruff-formatted, type-annotated, minimal com
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from llama_video.types import Frame, VideoInput
-
-
-@dataclass(frozen=True)
-class AdapterConfig:
-    """Base config for adapter-specific settings."""
-    name: str
 
 
 @dataclass(frozen=True)
@@ -318,7 +312,7 @@ New adapter code should have ≥90% coverage. Existing code coverage must not de
 3. **Gemma4 functional:** A Gemma4 adapter correctly processes frames at 1 FPS, builds timestamped image payloads with images-before-text ordering, uses Gemma-specific sampler defaults, and parses `<|channel>thought` thinking tags
 4. **Full isolation:** Each adapter has its own sampler preset, token estimation formula, and response parser. No cross-contamination.
 5. **Clean boundary:** No model-specific imports in extractor.py, image.py, server.py (only in adapters/ and their config)
-6. **Auto-detect:** WebUI can auto-select the correct adapter by probing llama-server's loaded model
+6. **Auto-detect:** Server and WebUI auto-select the correct adapter by probing llama-server's `/v1/models` endpoint when `model_profile="auto"` is specified (manual selection is the default)
 7. **Segmentation:** Videos exceeding max_duration are automatically chunked and processed
 8. **Extensible:** Adding a third adapter (e.g., InternVL) requires only a new file in `adapters/` and a registry entry — no changes to core modules
 9. **Coverage:** New adapter code ≥90% line coverage

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from llama_video.client import LlamaServerClient, _parse_stream_state, parse_model_response
+from llama_video.client import LlamaServerClient, parse_model_response
 from llama_video.config import ServerConfig
 from llama_video.preprocessor import VideoInput
 from llama_video.types import SuperFrame
@@ -335,35 +335,3 @@ class TestParseModelResponse:
         assert truncated is True
 
 
-class TestParseStreamState:
-    """Test _parse_stream_state for incremental streaming."""
-
-    def test_no_think_tag_yet(self):
-        thinking, caption, still = _parse_stream_state("Hello world")
-        assert thinking == ""
-        assert caption == "Hello world"
-        assert still is False
-
-    def test_think_tag_open_still_thinking(self):
-        thinking, caption, still = _parse_stream_state("<think>analyzing the")
-        assert thinking == "analyzing the"
-        assert caption == ""
-        assert still is True
-
-    def test_think_tag_closed(self):
-        thinking, caption, still = _parse_stream_state("<think>done thinking</think>The caption")
-        assert thinking == "done thinking"
-        assert caption == "The caption"
-        assert still is False
-
-    def test_empty_input(self):
-        thinking, caption, still = _parse_stream_state("")
-        assert thinking == ""
-        assert caption == ""
-        assert still is False
-
-    def test_partial_close_tag(self):
-        # </thin is not </think> — still inside thinking
-        thinking, _caption, still = _parse_stream_state("<think>reasoning</thin")
-        assert "reasoning" in thinking
-        assert still is True

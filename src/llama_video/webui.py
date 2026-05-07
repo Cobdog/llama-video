@@ -375,42 +375,19 @@ async def _caption_image(
     adapter: Any = None,
 ) -> tuple[str, str, str, bool, CaptionResult]:
     """Image captioning sub-pipeline using adapter for payload and parsing."""
-    # Build image message + system message payload through adapter-compatible path
     image_msg = build_image_message(path, prompt)
-    payload: dict[str, Any] = {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a media captioning assistant. Your reasoning is private and "
-                    "will not be shown to the user. Your response must contain the complete, "
-                    "detailed caption — do not summarize or abbreviate what you described "
-                    "in your reasoning. Write the full description in your response."
-                ),
-            },
-            image_msg,
-        ],
-        "max_tokens": max_tokens,
-        "temperature": preset.temperature,
-        "top_p": preset.top_p,
-        "top_k": preset.top_k,
-        "min_p": preset.min_p,
-        "presence_penalty": preset.presence_penalty,
-        "cache_prompt": cache_prompt,
-    }
     model_name = client._config.model_name if client._config.model_name else ""
-    if model_name:
-        payload["model"] = model_name
+    payload = adapter.build_image_payload(
+        image_msg,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        preset=preset,
+        model_name=model_name,
+    )
 
     result = await client.send_completion(payload)
 
-    # Parse through adapter if available (handles model-specific thinking tags)
-    if adapter is not None:
-        cap, thinking, truncated = adapter.parse_response(result.content)
-    else:
-        from llama_video.client import parse_model_response
-
-        cap, thinking, truncated = parse_model_response(result.content)
+    cap, thinking, truncated = adapter.parse_response(result.content)
     # Use structured reasoning from transport if available
     if result.reasoning:
         thinking = result.reasoning
@@ -1074,28 +1051,14 @@ def _build_caption_tab(
                     )
                 else:
                     image_msg = build_image_message(fp, prompt)
-                    payload: dict[str, Any] = {
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a media captioning assistant. Your reasoning is "
-                                    "private and will not be shown to the user. Your response "
-                                    "must contain the complete, detailed caption."
-                                ),
-                            },
-                            image_msg,
-                        ],
-                        "max_tokens": int(mt),
-                        "temperature": adapter_preset.temperature,
-                        "top_p": adapter_preset.top_p,
-                        "top_k": adapter_preset.top_k,
-                        "min_p": adapter_preset.min_p,
-                        "presence_penalty": adapter_preset.presence_penalty,
-                        "cache_prompt": use_cache,
-                    }
-                    if cfg.model_name:
-                        payload["model"] = cfg.model_name
+                    payload = stream_adapter.build_image_payload(
+                        image_msg,
+                        prompt=prompt,
+                        max_tokens=int(mt),
+                        preset=adapter_preset,
+                        cache_prompt=use_cache,
+                        model_name=cfg.model_name or "",
+                    )
 
                     accumulated_text = ""
                     final_caption = ""

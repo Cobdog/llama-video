@@ -73,24 +73,6 @@ def parse_model_response(text: str) -> tuple[str, str, bool]:
     return text.strip(), "", False
 
 
-def _parse_stream_state(raw: str) -> tuple[str, str, bool]:
-    """Parse accumulated streaming text into (thinking, caption, still_thinking).
-
-    Unlike parse_model_response (used for final results), this handles
-    the intermediate state where tokens are still arriving.
-    """
-    if _THINK_OPEN not in raw:
-        return "", raw, False
-
-    _, after_open = raw.split(_THINK_OPEN, 1)
-
-    if "</think>" in after_open:
-        thinking, caption = after_open.split("</think>", 1)
-        return thinking, caption, False
-
-    return after_open, "", True
-
-
 class LlamaServerClient:
     """Client for patched llama-server with video support.
 
@@ -451,11 +433,17 @@ class LlamaServerClient:
         in ``delta.reasoning_content`` and caption tokens in ``delta.content``.
         """
         client = await self._get_client()
-        async with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json=payload,
-        ) as response:
+        try:
+            stream_ctx = client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json=payload,
+            )
+        except httpx.ConnectError as e:
+            raise ServerUnreachableError(str(e), context={"url": self._config.url}) from e
+        except httpx.TimeoutException as e:
+            raise ServerResponseError(str(e)) from e
+        async with stream_ctx as response:
             if response.status_code == 503:
                 await response.aread()
                 raise ModelNotLoadedError(

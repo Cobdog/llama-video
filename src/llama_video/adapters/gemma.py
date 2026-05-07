@@ -109,7 +109,14 @@ class GemmaAdapter(ModelAdapter):
         # Store each frame as a single-channel SuperFrame for VideoInput compat.
         super_frames: list[SuperFrame] = []
         for i, frame in enumerate(frames):
-            arr = np.transpose(frame.data, (2, 0, 1)).astype(np.float32) / 255.0
+            data = frame.data
+            if resolution_scale != 1.0:
+                new_w = max(1, int(frame.width * resolution_scale))
+                new_h = max(1, int(frame.height * resolution_scale))
+                img = Image.fromarray(data)
+                img = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+                data = np.array(img, dtype=np.uint8)
+            arr = np.transpose(data, (2, 0, 1)).astype(np.float32) / 255.0
             super_frames.append(
                 SuperFrame(
                     data=arr,
@@ -125,6 +132,9 @@ class GemmaAdapter(ModelAdapter):
         temporal_positions = [round(frame.timestamp) for frame in frames]
 
         w, h = frames[0].width, frames[0].height
+        if resolution_scale != 1.0:
+            w = max(1, int(w * resolution_scale))
+            h = max(1, int(h * resolution_scale))
 
         return VideoInput(
             super_frames=super_frames,
@@ -190,6 +200,32 @@ class GemmaAdapter(ModelAdapter):
         if model_name:
             payload["model"] = model_name
 
+        return payload
+
+    # ── Image payload construction ─────────────────────────────────
+
+    def build_image_payload(
+        self,
+        image_message: dict[str, Any],
+        prompt: str,
+        max_tokens: int = 2048,
+        preset: AdapterPreset | None = None,
+        cache_prompt: bool = True,
+        model_name: str = "",
+    ) -> dict[str, Any]:
+        p = preset or self.default_preset
+        payload: dict[str, Any] = {
+            "messages": [_SYSTEM_MESSAGE, image_message],
+            "max_tokens": max_tokens,
+            "temperature": p.temperature,
+            "top_p": p.top_p,
+            "top_k": p.top_k,
+            "min_p": p.min_p,
+            "presence_penalty": p.presence_penalty,
+            "cache_prompt": cache_prompt,
+        }
+        if model_name:
+            payload["model"] = model_name
         return payload
 
     # ── Response parsing ───────────────────────────────────────────

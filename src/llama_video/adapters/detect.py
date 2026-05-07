@@ -29,7 +29,7 @@ def match_model_to_adapter(model_name: str) -> str | None:
     """Match a model name to an adapter using known patterns.
 
     Args:
-        model_name: Model name from llama-server (e.g. "MM-Sprinkle-Gemma4-31B-Q4").
+        model_name: Model name from llama-server (e.g. "gemma-4-31b-it-q4_k_m").
 
     Returns:
         Adapter name or None if no pattern matches.
