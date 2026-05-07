@@ -19,20 +19,19 @@ from typing import Any
 
 import gradio as gr
 
+from llama_video.adapters import AdapterPreset, get_adapter, list_adapters
+from llama_video.adapters.detect import detect_adapter as _detect_adapter
 from llama_video.batch import detect_mode
 from llama_video.client import LlamaServerClient
 from llama_video.config import (
     PRESETS,
-    InferencePreset,
-    ModelConfig,
     ServerConfig,
     get_preset,
 )
 from llama_video.errors import LlamaVideoError
 from llama_video.extractor import Extractor, ExtractorConfig
 from llama_video.history import CaptionHistory
-from llama_video.image import load_image
-from llama_video.preprocessor import Preprocessor
+from llama_video.image import build_image_message, load_image
 from llama_video.templates import BUILT_IN_TEMPLATES
 from llama_video.tokens import TokenEstimator
 from llama_video.types import CaptionMetadata, CaptionResult
@@ -246,15 +245,22 @@ async def _do_caption(
     timeout: float,
     resolution_scale: float = 1.0,
     cache_prompt: bool = True,
+    profile: str = "auto",
 ) -> tuple[str, str, str, bool, CaptionResult]:
     """Full pipeline: extract, preprocess, infer, return.
 
     Returns (caption, thinking, metadata_html, truncated, CaptionResult).
     """
+    # Resolve adapter profile
+    if profile == "auto":
+        adapter_name = await _detect_adapter(server_url)
+    else:
+        adapter_name = profile
+    adapter = get_adapter(adapter_name)
+
     cfg = ServerConfig(url=server_url, timeout=timeout)
     client = LlamaServerClient(cfg)
-    preset = InferencePreset(
-        name="webui",
+    adapter_preset = AdapterPreset(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
@@ -270,20 +276,22 @@ async def _do_caption(
                 max_frames,
                 max_tokens,
                 prompt,
-                preset,
+                adapter_preset,
                 client,
                 start,
                 resolution_scale,
                 cache_prompt,
+                adapter,
             )
         return await _caption_image(
             path,
             max_tokens,
             prompt,
-            preset,
+            adapter_preset,
             client,
             start,
             cache_prompt,
+            adapter,
         )
     finally:
         await client.close()
@@ -295,29 +303,33 @@ async def _caption_video(
     max_frames: int,
     max_tokens: int,
     prompt: str,
-    preset: InferencePreset,
+    preset: AdapterPreset,
     client: LlamaServerClient,
     start: float,
     resolution_scale: float = 1.0,
     cache_prompt: bool = True,
+    adapter: Any = None,
 ) -> tuple[str, str, str, bool, CaptionResult]:
     """Video captioning sub-pipeline."""
     ext = Extractor()
-    pre = Preprocessor()
     frames = await ext.extract_frames_async(
         path,
         ExtractorConfig(fps=fps, max_frames=max_frames),
     )
-    vi = pre.process(frames, fps=fps, resolution_scale=resolution_scale)
-    cap = await client.caption_video(
+
+    vi = adapter.preprocess(frames, fps=fps, resolution_scale=resolution_scale)
+    payload = adapter.build_payload(
         vi,
         prompt=prompt,
         max_tokens=max_tokens,
         preset=preset,
+        model_name=client._config.model_name if client._config.model_name else "",
         cache_prompt=cache_prompt,
     )
-    thinking = client.last_thinking
-    truncated = client.last_truncated
+    result = await client.send_completion(payload)
+    cap, thinking, truncated = adapter.parse_response(result.content)
+    if result.reasoning:
+        thinking = result.reasoning
     ms = (time.monotonic() - start) * 1000
     meta = build_metadata_html(
         "video",
@@ -356,26 +368,58 @@ async def _caption_image(
     path: str,
     max_tokens: int,
     prompt: str,
-    preset: InferencePreset,
+    preset: AdapterPreset,
     client: LlamaServerClient,
     start: float,
     cache_prompt: bool = True,
+    adapter: Any = None,
 ) -> tuple[str, str, str, bool, CaptionResult]:
-    """Image captioning sub-pipeline."""
-    cap = await client.caption_image(
-        path,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        preset=preset,
-        cache_prompt=cache_prompt,
-    )
-    thinking = client.last_thinking
-    truncated = client.last_truncated
+    """Image captioning sub-pipeline using adapter for payload and parsing."""
+    # Build image message + system message payload through adapter-compatible path
+    image_msg = build_image_message(path, prompt)
+    payload: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a media captioning assistant. Your reasoning is private and "
+                    "will not be shown to the user. Your response must contain the complete, "
+                    "detailed caption — do not summarize or abbreviate what you described "
+                    "in your reasoning. Write the full description in your response."
+                ),
+            },
+            image_msg,
+        ],
+        "max_tokens": max_tokens,
+        "temperature": preset.temperature,
+        "top_p": preset.top_p,
+        "top_k": preset.top_k,
+        "min_p": preset.min_p,
+        "presence_penalty": preset.presence_penalty,
+        "cache_prompt": cache_prompt,
+    }
+    model_name = client._config.model_name if client._config.model_name else ""
+    if model_name:
+        payload["model"] = model_name
+
+    result = await client.send_completion(payload)
+
+    # Parse through adapter if available (handles model-specific thinking tags)
+    if adapter is not None:
+        cap, thinking, truncated = adapter.parse_response(result.content)
+    else:
+        from llama_video.client import parse_model_response
+
+        cap, thinking, truncated = parse_model_response(result.content)
+    # Use structured reasoning from transport if available
+    if result.reasoning:
+        thinking = result.reasoning
+
     ms = (time.monotonic() - start) * 1000
     img = load_image(path)
     ih, iw = img.shape[:2]
-    m = ModelConfig.qwen35()
-    gu = m.grid_unit
+    # Use a reasonable grid unit for display metadata
+    gu = 28
     tw = max(gu, round(iw / gu) * gu)
     th = max(gu, round(ih / gu) * gu)
     hg, wg = th // gu, tw // gu
@@ -497,7 +541,7 @@ def create_app() -> gr.Blocks:
         gr.Markdown(
             "# llama-video\n"
             "Video & image captioning experimentation "
-            "for Qwen3.5 via patched llama.cpp"
+            "for multimodal models via llama.cpp"
         )
 
         with gr.Tabs():
@@ -591,6 +635,12 @@ def _build_caption_tab(
                     c_meta = gr.HTML()
 
             with gr.Column(scale=1, min_width=260):
+                _adapter_choices = ["auto", *list_adapters()]
+                c_profile = gr.Dropdown(
+                    label="Model Profile",
+                    choices=_adapter_choices,
+                    value="auto",
+                )
                 gr.Markdown("### Video")
                 c_fps = gr.Slider(
                     0.5,
@@ -878,6 +928,7 @@ def _build_caption_tab(
             res_name,
             do_stream,
             prev_visual,
+            profile,
         ):
             if not fp:
                 raise gr.Error("Upload a file first")
@@ -935,6 +986,7 @@ def _build_caption_tab(
                         tout,
                         rs,
                         use_cache,
+                        profile,
                     )
                 except LlamaVideoError as e:
                     raise gr.Error(str(e)) from e
@@ -947,38 +999,51 @@ def _build_caption_tab(
             # ── Streaming path ──
             cfg = ServerConfig(url=url, timeout=tout)
             client = LlamaServerClient(cfg)
-            preset = InferencePreset(
-                name="webui",
+            adapter_preset = AdapterPreset(
                 temperature=temp,
                 top_p=tp,
                 top_k=int(tk),
                 min_p=mp,
                 presence_penalty=pp,
             )
+            # Resolve adapter for streaming too
+            if profile == "auto":
+                stream_adapter_name = await _detect_adapter(url)
+            else:
+                stream_adapter_name = profile
+            stream_adapter = get_adapter(stream_adapter_name)
             start = time.monotonic()
 
             try:
                 if mode == "video":
                     ext = Extractor()
-                    pre = Preprocessor()
                     frames = await ext.extract_frames_async(
                         fp,
                         ExtractorConfig(fps=fps, max_frames=mf),
                     )
-                    vi = pre.process(frames, fps=fps, resolution_scale=rs)
-
-                    final_thinking = ""
-                    final_caption = ""
-                    async for thinking, caption, _ in client.stream_caption_video(
+                    vi = stream_adapter.preprocess(frames, fps=fps, resolution_scale=rs)
+                    payload = stream_adapter.build_payload(
                         vi,
                         prompt=prompt,
                         max_tokens=int(mt),
-                        preset=preset,
+                        preset=adapter_preset,
+                        model_name=cfg.model_name,
                         cache_prompt=use_cache,
-                    ):
-                        final_thinking = thinking
-                        final_caption = caption
-                        yield caption, thinking, "", gr.update(visible=False), cur_visual
+                    )
+
+                    accumulated_text = ""
+                    final_caption = ""
+                    final_thinking = ""
+                    async for token, is_reasoning in client.stream_completion(payload):
+                        accumulated_text += token
+                        if is_reasoning:
+                            final_thinking += token
+                        else:
+                            final_caption += token
+                        yield final_caption, final_thinking, "", gr.update(visible=False), cur_visual
+
+                    # Streaming already splits reasoning/content via is_reasoning flag.
+                    # No need to re-parse through adapter.
 
                     ms = (time.monotonic() - start) * 1000
                     meta = build_metadata_html(
@@ -1008,24 +1073,47 @@ def _build_caption_tab(
                         duration_ms=ms,
                     )
                 else:
-                    final_thinking = ""
+                    image_msg = build_image_message(fp, prompt)
+                    payload: dict[str, Any] = {
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a media captioning assistant. Your reasoning is "
+                                    "private and will not be shown to the user. Your response "
+                                    "must contain the complete, detailed caption."
+                                ),
+                            },
+                            image_msg,
+                        ],
+                        "max_tokens": int(mt),
+                        "temperature": adapter_preset.temperature,
+                        "top_p": adapter_preset.top_p,
+                        "top_k": adapter_preset.top_k,
+                        "min_p": adapter_preset.min_p,
+                        "presence_penalty": adapter_preset.presence_penalty,
+                        "cache_prompt": use_cache,
+                    }
+                    if cfg.model_name:
+                        payload["model"] = cfg.model_name
+
+                    accumulated_text = ""
                     final_caption = ""
-                    async for thinking, caption, _ in client.stream_caption_image(
-                        fp,
-                        prompt=prompt,
-                        max_tokens=int(mt),
-                        preset=preset,
-                        cache_prompt=use_cache,
-                    ):
-                        final_thinking = thinking
-                        final_caption = caption
-                        yield caption, thinking, "", gr.update(visible=False), cur_visual
+                    final_thinking = ""
+                    async for token, is_reasoning in client.stream_completion(payload):
+                        accumulated_text += token
+                        if is_reasoning:
+                            final_thinking += token
+                        else:
+                            final_caption += token
+                        yield final_caption, final_thinking, "", gr.update(visible=False), cur_visual
+
+                    # Streaming already splits reasoning/content via is_reasoning flag.
 
                     ms = (time.monotonic() - start) * 1000
                     img = load_image(fp)
                     ih, iw = img.shape[:2]
-                    m = ModelConfig.qwen35()
-                    gu = m.grid_unit
+                    gu = 28
                     tw = max(gu, round(iw / gu) * gu)
                     th = max(gu, round(ih / gu) * gu)
                     hg, wg = th // gu, tw // gu
@@ -1061,7 +1149,7 @@ def _build_caption_tab(
                     final_caption,
                     final_thinking,
                     meta,
-                    _warn_html(client.last_truncated),
+                    _warn_html(not final_caption and bool(final_thinking)),
                     cur_visual,
                 )
 
@@ -1090,6 +1178,7 @@ def _build_caption_tab(
                 c_res,
                 c_stream,
                 last_visual,
+                c_profile,
             ],
             outputs=[c_out, c_think, c_meta, c_warn, last_visual],
         )
@@ -1118,6 +1207,11 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
             label="Detected",
             interactive=False,
             max_lines=1,
+        )
+        cmp_profile = gr.Dropdown(
+            label="Model Profile",
+            choices=["auto", *list_adapters()],
+            value="auto",
         )
 
         with gr.Row(equal_height=False):
@@ -1269,6 +1363,7 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
             url,
             tout,
             res_name,
+            profile,
         ):
             if not fp:
                 raise gr.Error("Upload a file first")
@@ -1291,6 +1386,8 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
                     url,
                     tout,
                     rs,
+                    True,
+                    profile,
                 )
             except Exception as e:
                 raise gr.Error(str(e)) from e
@@ -1314,6 +1411,7 @@ def _build_compare_tab(empty_budget: str, default_cfg: ServerConfig) -> None:
                 cmp_url,
                 cmp_tout,
                 side["res"],
+                cmp_profile,
             ]
 
         def _side_outputs(
@@ -1552,6 +1650,11 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
                     step=30,
                     label="Timeout",
                 )
+                ba_profile = gr.Dropdown(
+                    label="Model Profile",
+                    choices=["auto", *list_adapters()],
+                    value="auto",
+                )
 
         async def _batch(
             files,
@@ -1564,6 +1667,7 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
             tout,
             preset_name,
             res_name,
+            profile,
         ):
             if not files:
                 raise gr.Error("No files uploaded")
@@ -1590,6 +1694,8 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
                         url,
                         tout,
                         rs,
+                        True,
+                        profile,
                     )
                     _save_result(res)
                     t = f"{res.duration_ms / 1000:.1f}s"
@@ -1625,6 +1731,7 @@ def _build_batch_tab(default_cfg: ServerConfig | None = None) -> None:
                 ba_tout,
                 ba_preset,
                 ba_res,
+                ba_profile,
             ],
             outputs=[ba_results],
         )

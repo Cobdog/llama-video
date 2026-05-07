@@ -96,10 +96,10 @@ async def batch_caption(
     Raises:
         ValueError: If paths is empty or contains mixed types in auto mode.
     """
+    from llama_video.adapters import AdapterPreset, get_adapter
     from llama_video.client import LlamaServerClient
     from llama_video.config import Settings, get_preset
     from llama_video.extractor import Extractor, ExtractorConfig
-    from llama_video.preprocessor import Preprocessor
 
     resolved_mode = validate_batch_mode(paths, mode)
     resolved_vars = variables or {}
@@ -120,17 +120,27 @@ async def batch_caption(
 
             if resolved_mode == "video":
                 extractor = Extractor(settings.extractor)
-                preprocessor = Preprocessor(settings.model)
+                adapter = get_adapter("auto")
                 frames = await extractor.extract_frames_async(
                     path, ExtractorConfig(fps=fps, max_frames=max_frames)
                 )
-                video_input = preprocessor.process(frames, fps=fps)
-                caption = await client.caption_video(
+                video_input = adapter.preprocess(frames, fps=fps)
+                adapter_preset = AdapterPreset(
+                    temperature=preset_obj.temperature,
+                    top_p=preset_obj.top_p,
+                    top_k=preset_obj.top_k,
+                    min_p=preset_obj.min_p,
+                    presence_penalty=preset_obj.presence_penalty,
+                )
+                payload = adapter.build_payload(
                     video_input,
                     prompt=rendered_prompt,
                     max_tokens=max_tokens,
-                    preset=preset_obj,
+                    preset=adapter_preset,
+                    model_name=settings.server.model_name,
                 )
+                result = await client.send_completion(payload)
+                caption, _, _ = adapter.parse_response(result.content)
                 metadata = CaptionMetadata(
                     frames_extracted=len(frames),
                     super_frames=len(video_input.super_frames),
@@ -138,12 +148,40 @@ async def batch_caption(
                     processing_time_ms=(time.monotonic() - start) * 1000,
                 )
             else:
-                caption = await client.caption_image(
-                    path,
-                    prompt=rendered_prompt,
-                    max_tokens=max_tokens,
-                    preset=preset_obj,
+                adapter = get_adapter("auto")
+                from llama_video.image import build_image_message
+
+                image_msg = build_image_message(path, rendered_prompt)
+                adapter_preset = AdapterPreset(
+                    temperature=preset_obj.temperature,
+                    top_p=preset_obj.top_p,
+                    top_k=preset_obj.top_k,
+                    min_p=preset_obj.min_p,
+                    presence_penalty=preset_obj.presence_penalty,
                 )
+                payload: dict[str, Any] = {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a media captioning assistant. Your reasoning is "
+                                "private and will not be shown to the user. Your response "
+                                "must contain the complete, detailed caption."
+                            ),
+                        },
+                        image_msg,
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": adapter_preset.temperature,
+                    "top_p": adapter_preset.top_p,
+                    "top_k": adapter_preset.top_k,
+                    "min_p": adapter_preset.min_p,
+                    "presence_penalty": adapter_preset.presence_penalty,
+                }
+                if settings.server.model_name:
+                    payload["model"] = settings.server.model_name
+                result = await client.send_completion(payload)
+                caption, _, _ = adapter.parse_response(result.content)
                 metadata = CaptionMetadata(
                     frames_extracted=1,
                     super_frames=0,

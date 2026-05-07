@@ -43,16 +43,16 @@ def cmd_extract(args: argparse.Namespace) -> None:
 
 def cmd_preprocess(args: argparse.Namespace) -> None:
     """Preprocess video and inspect super-frames."""
-    from llama_video.config import ExtractorSettings, ModelConfig
+    from llama_video.adapters import get_adapter
+    from llama_video.config import ExtractorSettings
     from llama_video.extractor import Extractor, ExtractorConfig
-    from llama_video.preprocessor import Preprocessor
 
     extractor = Extractor(ExtractorSettings())
     config = ExtractorConfig(fps=args.fps, max_frames=args.max_frames)
     frames = extractor.extract_frames(args.video, config)
 
-    preprocessor = Preprocessor(ModelConfig.qwen35())
-    result = preprocessor.process(frames, fps=args.fps)
+    adapter = get_adapter(args.model)
+    result = adapter.preprocess(frames, fps=args.fps)
 
     print(f"Source frames: {result.num_source_frames}")
     print(f"Super-frames:  {len(result.super_frames)}")

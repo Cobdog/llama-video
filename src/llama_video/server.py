@@ -11,11 +11,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 
 from llama_video import __version__
+from llama_video.adapters import AdapterPreset, get_adapter
 from llama_video.client import LlamaServerClient
-from llama_video.config import Settings
+from llama_video.config import Settings, get_preset
 from llama_video.errors import ExtractionError, LlamaVideoError, PreprocessingError
 from llama_video.extractor import Extractor, ExtractorConfig
-from llama_video.preprocessor import Preprocessor
+from llama_video.segmenter import segment_video
 from llama_video.types import (
     CaptionMetadata,
     CaptionRequest,
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 # Module-level state (set during lifespan)
 _settings: Settings | None = None
 _extractor: Extractor | None = None
-_preprocessor: Preprocessor | None = None
 _client: LlamaServerClient | None = None
 _last_debug: DebugInfo = DebugInfo()
 
@@ -37,11 +37,10 @@ _last_debug: DebugInfo = DebugInfo()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize and tear down application state."""
-    global _settings, _extractor, _preprocessor, _client
+    global _settings, _extractor, _client
 
     _settings = Settings()
     _extractor = Extractor(_settings.extractor)
-    _preprocessor = Preprocessor(_settings.model)
     _client = LlamaServerClient(_settings.server)
 
     logging.basicConfig(
@@ -61,7 +60,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="llama-video",
     version=__version__,
-    description="Video captioning service for Qwen3.5 GGUF models via patched llama.cpp",
+    description="Multi-model video captioning service via patched llama.cpp",
     lifespan=lifespan,
 )
 
@@ -70,66 +69,154 @@ app = FastAPI(
 async def caption_video(request: CaptionRequest) -> CaptionResponse:
     """Caption a video file.
 
-    Extracts frames, preprocesses into super-frames, sends to
-    patched llama-server, returns caption with metadata.
+    Extracts frames, preprocesses through the model adapter, sends to
+    llama-server, returns caption with metadata. Automatically segments
+    long videos based on adapter duration limits.
     """
     global _last_debug
     assert _extractor is not None
-    assert _preprocessor is not None
     assert _client is not None
 
     start_time = time.monotonic()
     debug: dict[str, Any] = {"request": request.model_dump()}
 
     try:
-        # Extract frames
-        t0 = time.monotonic()
-        extract_config = ExtractorConfig(fps=request.fps, max_frames=request.max_frames)
-        frames = await _extractor.extract_frames_async(request.video_path, extract_config)
-        debug["frames_extracted"] = len(frames)
-        debug["timing_extract_ms"] = (time.monotonic() - t0) * 1000
+        # Resolve adapter — "auto" triggers detection from llama-server
+        if request.model_profile == "auto":
+            from llama_video.adapters.detect import detect_adapter
 
-        # Preprocess
-        t0 = time.monotonic()
-        video_input = _preprocessor.process(frames, fps=request.fps)
-        debug["super_frame_shapes"] = [sf.shape for sf in video_input.super_frames]
-        debug["grid_thw"] = video_input.grid_thw
-        debug["temporal_positions"] = video_input.temporal_positions
-        debug["timing_preprocess_ms"] = (time.monotonic() - t0) * 1000
+            adapter_name = await detect_adapter(_settings.server.url)
+            adapter = get_adapter(adapter_name)
+            debug["auto_detected"] = adapter_name
+        else:
+            adapter = get_adapter(request.model_profile)
+        debug["adapter"] = adapter.name
 
-        # Caption
-        t0 = time.monotonic()
-        from llama_video.config import get_preset
+        # Get video info for segmentation decision
+        from pathlib import Path
 
-        preset = get_preset(request.preset)
-        caption = await _client.caption_video(
-            video_input,
-            prompt=request.prompt,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            preset=preset,
+        video_path = Path(request.video_path)
+        _, _, duration = await _extractor._get_video_info(video_path)
+
+        # Determine chunk size
+        chunk_seconds = request.chunk_duration_seconds
+        max_duration = adapter.max_duration_seconds
+
+        # Segment if video exceeds adapter limits
+        chunks = segment_video(
+            total_duration=duration,
+            chunk_seconds=chunk_seconds if chunk_seconds is not None else max_duration,
+            max_chunk_seconds=max_duration if max_duration != float("inf") else None,
         )
-        debug["timing_inference_ms"] = (time.monotonic() - t0) * 1000
+        debug["chunks"] = len(chunks)
+
+        # Build adapter preset from request
+        inference_preset = get_preset(request.preset)
+        adapter_preset = AdapterPreset(
+            temperature=request.temperature
+            if request.temperature is not None
+            else inference_preset.temperature,
+            top_p=inference_preset.top_p,
+            top_k=inference_preset.top_k,
+            min_p=inference_preset.min_p,
+            presence_penalty=inference_preset.presence_penalty,
+        )
+        model_name = _settings.server.model_name if _settings else ""
+
+        captions: list[str] = []
+        total_frames = 0
+        total_super_frames = 0
+        last_grid_thw: tuple[int, int, int] = (0, 0, 0)
+
+        for chunk in chunks:
+            # Extract frames for this chunk
+            t0 = time.monotonic()
+            extract_config = ExtractorConfig(
+                fps=request.fps,
+                max_frames=request.max_frames,
+                start_time=chunk.start_seconds if len(chunks) > 1 else None,
+                duration=chunk.duration if len(chunks) > 1 else None,
+            )
+            frames = await _extractor.extract_frames_async(request.video_path, extract_config)
+            total_frames += len(frames)
+            debug.setdefault("timing_extract_ms", 0)
+            debug["timing_extract_ms"] += (time.monotonic() - t0) * 1000
+
+            if not frames:
+                continue
+
+            # Preprocess through adapter
+            t0 = time.monotonic()
+            video_input = adapter.preprocess(frames, fps=request.fps)
+            total_super_frames += len(video_input.super_frames)
+            last_grid_thw = video_input.grid_thw
+            debug["grid_thw"] = video_input.grid_thw
+            debug["temporal_positions"] = video_input.temporal_positions
+            debug.setdefault("timing_preprocess_ms", 0)
+            debug["timing_preprocess_ms"] += (time.monotonic() - t0) * 1000
+
+            # Build payload and send
+            payload = adapter.build_payload(
+                video_input,
+                prompt=request.prompt,
+                max_tokens=request.max_tokens,
+                preset=adapter_preset,
+                model_name=model_name,
+            )
+
+            t0 = time.monotonic()
+            result = await _client.send_completion(payload)
+            # Use structured reasoning from transport if available, otherwise
+            # fall back to in-text tag parsing (for models that embed thinking inline)
+            if result.reasoning:
+                caption, thinking, truncated = adapter.parse_response(result.content)
+                thinking = result.reasoning
+            else:
+                caption, thinking, truncated = adapter.parse_response(result.content)
+            debug.setdefault("timing_inference_ms", 0)
+            debug["timing_inference_ms"] += (time.monotonic() - t0) * 1000
+
+            if thinking:
+                logger.info(
+                    "Chunk %d thinking: %d chars%s",
+                    chunk.index,
+                    len(thinking),
+                    " (truncated)" if truncated else "",
+                )
+
+            if caption:
+                captions.append(caption)
+
+        # Combine chunk captions
+        if len(captions) > 1:
+            combined = "\n\n".join(captions)
+        elif captions:
+            combined = captions[0]
+        else:
+            combined = ""
 
         total_ms = (time.monotonic() - start_time) * 1000
+        logger.info(
+            "Caption received: %d chars (%.0fms, %d chunks)", len(combined), total_ms, len(chunks)
+        )
 
         metadata = CaptionMetadata(
-            frames_extracted=len(frames),
-            super_frames=len(video_input.super_frames),
-            grid_thw=video_input.grid_thw,
+            frames_extracted=total_frames,
+            super_frames=total_super_frames,
+            grid_thw=last_grid_thw,
             processing_time_ms=total_ms,
         )
 
         _last_debug = DebugInfo(
             request=debug.get("request"),
-            frames_extracted=debug.get("frames_extracted"),
+            frames_extracted=total_frames,
             super_frame_shapes=debug.get("super_frame_shapes"),
             grid_thw=debug.get("grid_thw"),
             temporal_positions=debug.get("temporal_positions"),
             timing={k: v for k, v in debug.items() if k.startswith("timing_")},
         )
 
-        return CaptionResponse(caption=caption, metadata=metadata)
+        return CaptionResponse(caption=combined, metadata=metadata)
 
     except ExtractionError as e:
         logger.error("Extraction failed: %s", e, extra={"context": e.context})

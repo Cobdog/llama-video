@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from llama_video.adapters.base import ModelAdapter
     from llama_video.preprocessor import VideoInput
 
 
@@ -70,11 +71,19 @@ class TokenEstimator:
         prompt: str = "",
         max_tokens: int = 2048,
         context_limit: int = 65536,
+        adapter: ModelAdapter | None = None,
     ) -> TokenBudget:
-        """Estimate token budget from a preprocessed VideoInput (exact)."""
+        """Estimate token budget from a preprocessed VideoInput (exact).
+
+        When an adapter is provided, delegates token counting to the adapter's
+        estimate_tokens() method. Otherwise falls back to the Qwen T*H*W formula.
+        """
         if video_input is not None:
-            t, h, w = video_input.grid_thw
-            vision_tokens = t * h * w
+            if adapter is not None:
+                vision_tokens = adapter.estimate_tokens(video_input)
+            else:
+                t, h, w = video_input.grid_thw
+                vision_tokens = t * h * w
         else:
             vision_tokens = 0
 

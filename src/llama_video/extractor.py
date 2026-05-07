@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class ExtractorConfig:
     """Configuration for a single extraction run."""
 
-    __slots__ = ("fps", "max_frames", "min_frames", "strategy")
+    __slots__ = ("duration", "fps", "max_frames", "min_frames", "start_time", "strategy")
 
     def __init__(
         self,
@@ -36,11 +36,15 @@ class ExtractorConfig:
         max_frames: int = 64,
         min_frames: int = 1,
         strategy: SamplingStrategy = SamplingStrategy.UNIFORM,
+        start_time: float | None = None,
+        duration: float | None = None,
     ) -> None:
         self.fps = fps
         self.max_frames = max_frames
         self.min_frames = min_frames
         self.strategy = strategy
+        self.start_time = start_time
+        self.duration = duration
 
 
 class Extractor:
@@ -175,22 +179,33 @@ class Extractor:
         )
 
         # Build ffmpeg command for raw RGB output to stdout
-        cmd = [
-            self.ffmpeg_path,
-            "-i",
-            str(video_path),
-            "-vf",
-            f"fps={config.fps}",
-            "-frames:v",
-            str(config.max_frames),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-v",
-            "error",
-            "pipe:1",
-        ]
+        cmd = [self.ffmpeg_path]
+
+        # Seek to start position before input for fast seeking
+        if config.start_time is not None:
+            cmd.extend(["-ss", f"{config.start_time:.3f}"])
+
+        cmd.extend(["-i", str(video_path)])
+
+        # Limit duration after input for accurate clipping
+        if config.duration is not None:
+            cmd.extend(["-t", f"{config.duration:.3f}"])
+
+        cmd.extend(
+            [
+                "-vf",
+                f"fps={config.fps}",
+                "-frames:v",
+                str(config.max_frames),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-v",
+                "error",
+                "pipe:1",
+            ]
+        )
 
         # Also need dimensions — get them first
         width, height, duration = await self._get_video_info(video_path)
@@ -247,11 +262,12 @@ class Extractor:
             )
 
         frames: list[Frame] = []
+        start_offset = config.start_time or 0.0
         for i in range(num_frames):
             offset = i * frame_size
             frame_bytes = raw_data[offset : offset + frame_size]
             data = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(height, width, 3)
-            timestamp = i / config.fps
+            timestamp = start_offset + i / config.fps
 
             frames.append(
                 Frame(

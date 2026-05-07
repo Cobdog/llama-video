@@ -102,6 +102,9 @@ class CaptionRequest(BaseModel):
     temperature: float | None = Field(
         default=None, ge=0, le=2, description="Override preset temperature"
     )
+    chunk_duration_seconds: float | None = Field(
+        default=None, gt=0, description="Chunk duration for long videos (auto-detected if None)"
+    )
 
 
 class CaptionMetadata(BaseModel):

@@ -7,7 +7,7 @@ import io
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
 import numpy as np
@@ -26,6 +26,14 @@ if TYPE_CHECKING:
     from llama_video.preprocessor import VideoInput
 
 logger = logging.getLogger(__name__)
+
+
+class CompletionResult(NamedTuple):
+    """Structured response from a chat completion."""
+
+    content: str
+    reasoning: str
+
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _THINK_OPEN = "<think>"
@@ -195,6 +203,14 @@ class LlamaServerClient:
         if not content:
             content = msg.get("reasoning_content", "") or ""
         return str(content)
+
+    @staticmethod
+    def _extract_completion(data: dict[str, Any]) -> CompletionResult:
+        """Extract both content and reasoning from a chat completions response."""
+        msg = data["choices"][0]["message"]
+        content = str(msg.get("content", "") or "")
+        reasoning = str(msg.get("reasoning_content", "") or "")
+        return CompletionResult(content=content, reasoning=reasoning)
 
     async def caption_video(
         self,
@@ -594,6 +610,97 @@ class LlamaServerClient:
 
         self.last_thinking = thinking
         self.last_truncated = not caption and bool(thinking)
+
+    async def stream_completion(
+        self,
+        payload: dict[str, Any],
+    ) -> AsyncGenerator[tuple[str, bool], None]:
+        """Stream a pre-built chat completion payload, yielding (token, is_reasoning).
+
+        Model-agnostic streaming transport. The caller is responsible for
+        payload construction and final response parsing — this method only
+        handles HTTP transport and SSE parsing.
+
+        Args:
+            payload: Complete chat completion payload (must include "stream": True).
+
+        Yields:
+            (token_text, is_reasoning) tuples.
+        """
+        payload = {**payload, "stream": True}
+        async for token, is_reasoning in self._iter_sse_tokens(payload):
+            yield token, is_reasoning
+
+    async def send_completion(self, payload: dict[str, Any]) -> CompletionResult:
+        """Send a pre-built chat completion payload and return structured response.
+
+        This is the model-agnostic transport method used by the adapter pipeline.
+        The caller (server.py via adapter) is responsible for payload construction
+        and response parsing — this method only handles HTTP transport and retries.
+
+        Args:
+            payload: Complete chat completion payload dict.
+
+        Returns:
+            CompletionResult with content and reasoning fields.
+
+        Raises:
+            ServerUnreachableError: Cannot connect to llama-server.
+            ServerResponseError: Server returned an error.
+            ModelNotLoadedError: No model loaded on server.
+        """
+        client = await self._get_client()
+
+        attempt = 0
+        last_error: Exception | None = None
+
+        while attempt <= self._config.max_retries:
+            try:
+                response = await client.post("/v1/chat/completions", json=payload)
+
+                if response.status_code == 503:
+                    raise ModelNotLoadedError(
+                        "llama-server has no model loaded",
+                        context={"status": 503, "body": response.text[:500]},
+                    )
+
+                if response.status_code != 200:
+                    raise ServerResponseError(
+                        f"llama-server error {response.status_code}: {response.text[:500]}",
+                        context={"status": response.status_code},
+                    )
+
+                data = response.json()
+                result = self._extract_completion(data)
+                logger.info(
+                    "Completion received: %d chars content, %d chars reasoning",
+                    len(result.content),
+                    len(result.reasoning),
+                )
+                return result
+
+            except httpx.ConnectError as e:
+                last_error = ServerUnreachableError(
+                    f"Cannot connect to llama-server at {self._config.url}",
+                    context={"url": self._config.url, "error": str(e)},
+                )
+            except httpx.TimeoutException as e:
+                last_error = ServerResponseError(
+                    f"llama-server request timed out after {self._config.timeout}s",
+                    context={"timeout": self._config.timeout, "error": str(e)},
+                )
+
+            attempt += 1
+            if attempt <= self._config.max_retries:
+                import asyncio
+
+                delay = self._config.retry_delay * (2 ** (attempt - 1))
+                logger.warning("Retry %d/%d after %.1fs", attempt, self._config.max_retries, delay)
+                await asyncio.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+        raise ServerUnreachableError("Failed to connect to llama-server after retries")
 
     async def health_check(self) -> bool:
         """Check if llama-server is reachable and healthy."""
