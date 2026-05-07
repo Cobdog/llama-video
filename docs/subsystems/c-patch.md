@@ -9,6 +9,8 @@
 
 Minimal modifications to llama.cpp's multimodal pipeline to accept video frame sequences with proper temporal encoding for Qwen3.5 models.
 
+> **Note:** This C patch is **Qwen3.5-specific**. It adds 6-channel super-frame support and temporal M-RoPE encoding that only the Qwen3.5 vision encoder (`qwen3vl.cpp`) uses. Other model families (e.g., Gemma4) work with stock llama.cpp and do not require this patch.
+
 ## Patch File
 
 A single unified patch lives in `patches/`:

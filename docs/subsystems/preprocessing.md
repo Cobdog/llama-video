@@ -9,6 +9,8 @@
 
 Turn extracted `Frame`s into the tensor shape the Qwen3.5 vision encoder expects: 6-channel super-frames, a `grid_thw` triple, and M-RoPE temporal indices. All of that is packed into `VideoInput` and handed to `LlamaServerClient.caption_video()`.
 
+> **Note:** This document describes the Qwen3.5-specific `Preprocessor` pipeline. Other model families (e.g., Gemma4) use the adapter system (`src/llama_video/adapters/`) which handles preprocessing, payload construction, and response parsing per family. The adapter layer delegates to this `Preprocessor` for Qwen3.5 models but uses its own logic for others.
+
 ## Key classes
 
 ### `Preprocessor`

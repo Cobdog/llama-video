@@ -175,7 +175,7 @@ Image payload (no `mm_processor_kwargs`):
 
 ### Streaming and reasoning-mode output
 
-`caption_video` awaits the full response (no streaming to the caller). Internally, `parse_model_response` in `client.py` separates Qwen's reasoning-mode output (the `<think>...</think>` block) from the final caption so callers get just the answer text.
+`send_completion` awaits the full response and returns a `CompletionResult(content, reasoning)`. The `reasoning` field captures the model's thinking output when the server separates it (e.g., Gemma4 via `reasoning_content` in the JSON response). For models where thinking is embedded inline (e.g., Qwen3.5's thinking tags), `adapter.parse_response()` extracts it from the content text.
 
 ---
 

@@ -1,6 +1,6 @@
 """llama-video: Temporal video support for llama.cpp.
 
-Frame extraction, preprocessing, and captioning service for Qwen3.5 GGUF models.
+Frame extraction, multi-model adapters, and captioning service for multimodal GGUF models.
 """
 
 from llama_video.batch import batch_caption, detect_mode, validate_batch_mode

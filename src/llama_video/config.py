@@ -12,7 +12,8 @@ from pydantic_settings import BaseSettings
 class InferencePreset:
     """Named set of inference parameters for caption generation.
 
-    Based on official Qwen team recommendations for thinking mode.
+    Defaults are based on official Qwen team recommendations for thinking mode.
+    Individual adapters may override or ignore these when building payloads.
     """
 
     name: str
@@ -51,7 +52,8 @@ def get_preset(name: str) -> InferencePreset:
 class ModelConfig(BaseSettings):
     """Vision encoder configuration for a model family.
 
-    Defaults are for Qwen3.5 — all sizes share the same vision encoder.
+    Defaults are for Qwen3.5 (all sizes share the same vision encoder).
+    Other model families use adapter-specific configs via the adapter registry.
     """
 
     temporal_patch_size: int = Field(default=2, description="Frames per temporal patch")

@@ -1,8 +1,8 @@
 # llama-video
 
-Temporal video captioning for llama.cpp — frame extraction, super-frame preprocessing, and M-RoPE temporal encoding for Qwen3.5 GGUF models.
+Temporal video captioning for llama.cpp — frame extraction, multi-model adapters, and M-RoPE temporal encoding for multimodal GGUF models.
 
-> **Why a patch?** Sending multiple images to llama.cpp gives zero temporal understanding. The model needs 6-channel super-frames (Conv3D) and temporal M-RoPE positions to reason about motion, sequence, and change. This patch adds that.
+> **Why a patch?** Sending multiple images to llama.cpp gives zero temporal understanding. For Qwen3.5 models, the vision encoder needs 6-channel super-frames (Conv3D) and temporal M-RoPE positions to reason about motion, sequence, and change. This patch adds that. Other models (e.g., Gemma4) work with stock llama.cpp and use the adapter layer instead.
 
 ---
 
@@ -38,23 +38,32 @@ Temporal video captioning for llama.cpp — frame extraction, super-frame prepro
 ## At a glance
 
 ```
-┌────────────┐   ffmpeg    ┌──────────────┐   6-channel   ┌──────────────────┐
-│ video file │ ──────────▶ │ super-frames │ ───────────▶ │ patched          │
-│  (.mp4)    │  2 fps      │ + M-RoPE t   │  image_url    │ llama-server     │
-└────────────┘             └──────────────┘  + metadata   │ (Qwen3.5 GGUF)   │
-                                                          └──────────────────┘
-                                                                  │
-                                                                  ▼
-                                                           caption text
+┌────────────┐   ffmpeg    ┌──────────────┐  adapter    ┌──────────────────┐
+│ video file │ ──────────▶ │ model        │ ──────────▶ │ llama-server     │
+│  (.mp4)    │  2 fps      │ adapter      │  payload    │ (Qwen3.5 GGUF   │
+└────────────┘             │ (Qwen3.5 /   │             │  or Gemma4 GGUF) │
+                           │  Gemma4)     │             └──────────────────┘
+                           └──────────────┘                     │
+                                                                ▼
+                                                         caption text
 ```
 
 Three moving parts:
 
-1. A **C patch** against llama.cpp's `tools/mtmd/` and `tools/server/` that adds a `VIDEO` chunk type, per-super-frame temporal M-RoPE positions, and a `mm_processor_kwargs` passthrough on `/v1/chat/completions`.
-2. A **Python library** that extracts frames with ffmpeg, pairs them into 6-channel super-frames, computes grid THW + temporal indices, and POSTs to the patched `llama-server`.
+1. A **C patch** against llama.cpp's `tools/mtmd/` and `tools/server/` that adds a `VIDEO` chunk type, per-super-frame temporal M-RoPE positions, and a `mm_processor_kwargs` passthrough on `/v1/chat/completions` (required for Qwen3.5 only).
+2. A **Python library** with a multi-model adapter architecture that extracts frames with ffmpeg, preprocesses them per model family, and POSTs to `llama-server`.
 3. **User surfaces** on top of that library: a FastAPI HTTP service, a Gradio WebUI, and a debug CLI.
 
 ## Supported models
+
+Two model families are currently supported via the adapter system. Each adapter handles preprocessing, payload construction, and response parsing for its family.
+
+| Model family | Patch required | Notes |
+|-------------|---------------|-------|
+| **Qwen3.5** (all sizes) | Yes | 6-channel super-frames, temporal M-RoPE via C patch |
+| **Gemma4** (27B, 31B) | No | Works with stock llama.cpp; native video support |
+
+### Qwen3.5 models
 
 All Qwen3.5 vision models share the same vision encoder (`temporal_patch_size=2`, `spatial_patch_size=14`, `merge_size=2`), so one patch covers every size:
 
@@ -65,6 +74,15 @@ All Qwen3.5 vision models share the same vision encoder (`temporal_patch_size=2`
 | Qwen3.5-35B-A3B | 3B / 35B | MoE — recommended starting point |
 | Qwen3.5-122B-A10B | 10B / 122B | MoE — best quality/VRAM ratio |
 | Qwen3.5-397B-A17B | 17B / 397B | Largest MoE |
+
+### Gemma4 models
+
+Gemma4 models process video frames natively through llama.cpp's multimodal pipeline — no super-frame patching needed. Each frame is sent as a standard `image_url` with integer timestamps.
+
+| Model | Params | Notes |
+|-------|--------|-------|
+| Gemma4-27B | 27B | Good quality/VRAM balance |
+| MM-Sprinkle-Gemma4-31B | 31B | Community fine-tune with strong video understanding |
 
 Each model requires **two files**: the GGUF model and the mmproj (vision projector) GGUF.
 
@@ -196,10 +214,15 @@ cmake --build build -j%NUMBER_OF_PROCESSORS%
 
 ### 4. Download a model
 
-Grab the GGUF model **and** its mmproj from HuggingFace. Example for Qwen3.5-35B-A3B:
+Grab the GGUF model **and** its mmproj from HuggingFace. Examples:
 
+**Qwen3.5** (requires the C patch from step 2):
 - `qwen3.5-35b-a3b-q4_k_m.gguf` — quantized weights
 - `mmproj-Qwen3.5-35B-A3B-F16.gguf` — vision projector
+
+**Gemma4** (works with stock llama.cpp, no patch needed):
+- `MM-Sprinkle-Gemma4-31B-Q4_K_M.gguf` — quantized model
+- `mmproj-MM-Sprinkle-Gemma4-31B-F16.gguf` — vision projector
 
 Any community quant works; the mmproj must match the model family.
 
@@ -230,7 +253,7 @@ llama.cpp\build\bin\Release\llama-server.exe ^
 Required and notable flags:
 
 - `--mmproj` — the vision projector GGUF. Without it, the server has no vision encoder.
-- `--jinja` — required for Qwen3.5's chat template.
+- `--jinja` — required for Qwen3.5's chat template (Gemma4 works without it).
 - `--ctx-size` — context window. More frames × higher resolution = more vision tokens = needs a bigger window. 65536 is a sensible default.
 - `--port 8080` — the default port llama-video expects. Override via `LLAMA_SERVER_URL`.
 
@@ -248,22 +271,36 @@ Minimal end-to-end example (requires a running `llama-server` from step 5):
 
 ```python
 import asyncio
-from llama_video import Extractor, Preprocessor, Settings, get_preset
+from llama_video import Extractor, Settings, get_preset
+from llama_video.adapters import get_adapter, AdapterPreset
 from llama_video.client import LlamaServerClient
 
 async def caption(video_path: str) -> str:
     settings = Settings()
     extractor = Extractor(settings.extractor)
-    preprocessor = Preprocessor(settings.model)
+    adapter = get_adapter("qwen3.5")   # or "gemma4"
     client = LlamaServerClient(settings.server)
     try:
         frames = await extractor.extract_frames_async(video_path)
-        video_input = preprocessor.process(frames, fps=2.0)
-        return await client.caption_video(
+        video_input = adapter.preprocess(frames, fps=2.0)
+        preset = get_preset("default")
+        adapter_preset = AdapterPreset(
+            temperature=preset.temperature,
+            top_p=preset.top_p,
+            top_k=preset.top_k,
+            min_p=preset.min_p,
+            presence_penalty=preset.presence_penalty,
+        )
+        payload = adapter.build_payload(
             video_input,
             prompt="Describe what happens in this video.",
-            preset=get_preset("default"),
+            max_tokens=2048,
+            preset=adapter_preset,
+            model_name=settings.server.model_name,
         )
+        result = await client.send_completion(payload)
+        caption, thinking, truncated = adapter.parse_response(result.content)
+        return caption
     finally:
         await client.close()
 
@@ -274,6 +311,7 @@ Re-exported from the top-level package:
 
 - Config: `Settings`, `ModelConfig`, `ServerConfig`, `PRESETS`, `InferencePreset`, `get_preset`
 - Pipeline: `Extractor`, `ExtractorConfig`, `Preprocessor`, `VideoInput`
+- Adapters: `ModelAdapter`, `AdapterPreset`, `get_adapter`, `list_adapters`, `register_adapter` (from `llama_video.adapters`)
 - Templates: `PromptTemplate`, `BUILT_IN_TEMPLATES`, `get_template`, `get_templates`, `render_template`
 - Tokens: `TokenBudget`, `TokenEstimator`
 - History: `CaptionHistory`
@@ -308,7 +346,7 @@ Request body (`POST /v1/caption`):
   "prompt": "Describe what happens in this video.",
   "fps": 2.0,
   "max_frames": 64,
-  "model_profile": "qwen3.5",
+  "model_profile": "qwen3.5",    // or "gemma4", "auto"
   "max_tokens": 2048,
   "preset": "default",
   "temperature": null
@@ -393,7 +431,7 @@ Every `Settings` field can be overridden with an env var. Prefixes:
 
 ### Inference presets
 
-Two built-in presets (based on official Qwen team recommendations):
+Two built-in presets (based on official Qwen team recommendations; adapters pass these through to the sampler):
 
 | Preset | Temperature | Top P | Top K | Min P | Presence penalty | Use case |
 |--------|-------------|-------|-------|-------|------------------|----------|
@@ -460,9 +498,9 @@ The WebUI has a live token-budget bar so you can tune before running inference.
 - **One `llama-server` at a time.** Each instance loads the full model into VRAM. `scripts/run-server.sh` guards against accidental duplicates.
 - **ffmpeg must be on PATH** — or set `LLAMA_VIDEO_FFMPEG_PATH` to the binary's full path.
 - **Only uniform sampling is implemented.** `SamplingStrategy` declares `KEYFRAME` and `SCENE_CHANGE`, but only `UNIFORM` is actually wired through ffmpeg.
-- **Thinking mode is verbose.** With the `default` preset Qwen3.5 emits internal reasoning before the final caption; the library extracts the answer automatically but the round-trip can take 30-120s for longer videos. Set timeouts accordingly.
+- **Thinking mode is verbose.** With the `default` preset, Qwen3.5 emits internal reasoning via `<think >` tags and Gemma4 emits it via `reasoning_content`. The library extracts the answer automatically but the round-trip can take 30-120s for longer videos. Set timeouts accordingly.
 - **No audio processing.** Only visual frames are extracted; audio tracks are ignored.
-- **Super-frame pairing.** Frames are paired sequentially (`0+1`, `2+3`, …). Odd counts default to duplicating the last frame (`odd_strategy=PAD`); pass `OddFrameStrategy.DROP` to drop it instead. Extracting an even number of frames avoids the question.
+- **Super-frame pairing (Qwen3.5 only).** Frames are paired sequentially (`0+1`, `2+3`, …). Odd counts default to duplicating the last frame (`odd_strategy=PAD`); pass `OddFrameStrategy.DROP` to drop it instead. Extracting an even number of frames avoids the question.
 
 ### Windows notes
 
@@ -481,7 +519,7 @@ The WebUI has a live token-budget bar so you can tune before running inference.
 | `Extracted 0 frames` | FPS × clip length rounded to 0 | Lower FPS, or use a longer clip |
 | `llama-server has no model loaded` (503) | Server running but `--mmproj` missing or model path wrong | Re-check the server command line |
 | Patch apply fails | Upstream drifted from `0adede8` | `git checkout 0adede8` in llama.cpp, or retry with `git apply --3way` |
-| Caption arrives but describes isolated frames ("I see several images…") | Patch not active, or model treated input as multi-image | Run `llama-video-debug validate-patch` to confirm; rebuild llama.cpp |
+| Caption arrives but describes isolated frames ("I see several images…") | Patch not active, or model treated input as multi-image | Run `llama-video-debug validate-patch` to confirm; rebuild llama.cpp. Only affects Qwen3.5 — Gemma4 doesn't need the patch |
 | Timeout on long videos | Default HTTP timeout too low | Raise `LLAMA_SERVER_TIMEOUT` |
 | `GGML_CUDA:BOOL=OFF` in CMakeCache | `nvcc` not discovered at cmake time | Put CUDA bin on PATH and re-run `cmake -B build -DGGML_CUDA=ON` |
 
@@ -495,6 +533,12 @@ For layer-by-layer debugging across frame extraction → preprocessing → C pat
 llama-video/
 ├── src/llama_video/         # Python library
 │   ├── __init__.py          # Top-level re-exports
+│   ├── adapters/            # Multi-model adapter system
+│   │   ├── base.py          # ModelAdapter ABC + AdapterPreset
+│   │   ├── registry.py      # Adapter registry (get_adapter, register_adapter)
+│   │   ├── detect.py        # Auto-detect adapter from llama-server
+│   │   ├── qwen.py          # Qwen3.5 adapter (super-frames, M-RoPE)
+│   │   └── gemma.py         # Gemma4 adapter (native video via timestamps)
 │   ├── config.py            # Settings + InferencePreset + ModelConfig
 │   ├── extractor.py         # ffmpeg frame extraction
 │   ├── preprocessor.py      # Super-frame construction, grid THW, M-RoPE positions
@@ -528,6 +572,7 @@ llama-video/
 - [`docs/subsystems/frame-extraction.md`](docs/subsystems/frame-extraction.md) — Extractor API and ffmpeg details.
 - [`docs/subsystems/preprocessing.md`](docs/subsystems/preprocessing.md) — super-frame construction, grid THW, M-RoPE positions.
 - [`docs/subsystems/api-server.md`](docs/subsystems/api-server.md) — HTTP service and llama-server client.
+- [`docs/subsystems/adapters.md`](docs/subsystems/adapters.md) — multi-model adapter system (if present).
 - [`docs/references/qwen35-vision-architecture.md`](docs/references/qwen35-vision-architecture.md) — Qwen3.5 vision encoder details.
 - [`docs/references/llamacpp-multimodal-internals.md`](docs/references/llamacpp-multimodal-internals.md) — `libmtmd` + `clip.cpp` internals.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — what's planned next.

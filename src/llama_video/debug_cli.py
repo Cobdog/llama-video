@@ -2,7 +2,7 @@
 
 Usage:
     llama-video-debug extract <video> [--fps N] [--output-dir DIR]
-    llama-video-debug preprocess <video> [--fps N] [--model qwen3.5]
+    llama-video-debug preprocess <video> [--fps N] [--model ADAPTER]
     llama-video-debug compare-modes <video> [--server-url URL]
     llama-video-debug trace <video> [--prompt TEXT] [--server-url URL]
     llama-video-debug validate-patch [--server-url URL]

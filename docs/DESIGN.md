@@ -13,7 +13,7 @@ The C layer is intentionally tiny. Most of the complexity is in Python where ite
 
 ### 1. Minimal patch surface
 
-Every line added to llama.cpp is a line that must be rebased onto a moving upstream. The patch changes exactly what's needed for Qwen3.5 video decoding:
+Every line added to llama.cpp is a line that must be rebased onto a moving upstream. The patch changes exactly what's needed for Qwen3.5 video decoding (Gemma4 and other stock models do not need this patch):
 
 - Add an `is_video` flag to `clip_image_f32_batch`.
 - Route 6-channel super-frames through the existing Conv3D decomposition in `qwen3vl.cpp`.
@@ -28,7 +28,7 @@ ffmpeg, retry logic, timeouts, error types, logging, the FastAPI service, the Gr
 
 ### 3. Model-agnostic where possible
 
-`ModelConfig` centralizes `temporal_patch_size`, `spatial_patch_size`, `merge_size`, pixel bounds, and CLIP normalization constants. Adding a future model family is a new config profile plus (if its encoder differs) a new `tools/mtmd/models/*.cpp` branch.
+`ModelConfig` centralizes `temporal_patch_size`, `spatial_patch_size`, `merge_size`, pixel bounds, and CLIP normalization constants. Adding a future model family is a new config profile plus (if its encoder differs) a new `tools/mtmd/models/*.cpp` branch. The `ModelAdapter` base class (`src/llama_video/adapters/base.py`) provides a per-family interface for preprocessing, payload construction, response parsing, and token estimation, with concrete implementations for Qwen3.5 and Gemma4.
 
 ### 4. Fail loudly
 
@@ -48,6 +48,8 @@ No silent fallback from video → multi-image mode. If the preprocessor can't bu
 
 ### Preprocessor — `src/llama_video/preprocessor.py`
 
+> **Note:** This is the Qwen3.5-specific pipeline. Other model families use the adapter system (`src/llama_video/adapters/`) which has its own preprocessing logic.
+
 Takes extracted `Frame`s plus a `ModelConfig`, produces a `VideoInput` ready for the vision encoder:
 
 - Resize every frame so the pixel count is within `[min_pixels, max_pixels]` and divisible by `grid_unit = spatial_patch_size × merge_size` (28 for Qwen3.5). Interpolation is BICUBIC (matches HF reference).
@@ -62,15 +64,14 @@ Output is the `VideoInput` passed to `LlamaServerClient.caption_video()`.
 
 `LlamaServerClient`:
 
-- `caption_video(video_input, prompt, max_tokens=2048, temperature=None, preset=None, cache_prompt=True) -> str`
-- `caption_image(image_path, prompt, ..., cache_prompt=True) -> str`
+- `send_completion(payload) -> CompletionResult(content, reasoning)` — sends a chat completion payload and returns both the content and reasoning fields.
+- `stream_completion(payload) -> AsyncGenerator[tuple[str, bool], None]` — streaming variant that yields `(token, is_reasoning)` tuples.
 - `health_check() -> bool`
 
-Sends the standard OpenAI `/v1/chat/completions` payload: an `image_url` entry per frame (each super-frame decomposes back to its two source JPEGs, base64-encoded as `data:image/jpeg;base64,...`) plus a `mm_processor_kwargs` block carrying `fps`, `is_video`, `grid_thw`, `temporal_positions`. The patched server reads `mm_processor_kwargs` to drive the video chunk construction.
+The adapter layer builds the payload (model-specific content, `mm_processor_kwargs` for Qwen3.5, etc.) and calls `send_completion`. The `CompletionResult` captures both `content` and `reasoning_content` from the llama-server response — the latter is used by models like Gemma4 that separate thinking output from the final answer.
 
 - Retry with exponential backoff (`max_retries`, `retry_delay` from `ServerConfig`).
 - HTTP timeout from `LLAMA_SERVER_TIMEOUT` (default 600s — thinking mode can be slow).
-- Streaming parser in `_parse_stream_state` / `parse_model_response` separates reasoning-mode output from the final caption.
 
 ### HTTP service — `src/llama_video/server.py`
 
@@ -94,6 +95,24 @@ Four config classes, all Pydantic `BaseSettings` so fields load from env vars:
 - `ServiceConfig` — `LLAMA_VIDEO_*` prefix (bind host/port/workers/log level)
 
 `Settings` bundles all four under a single root. See the README's env-var table for the full list.
+
+### Model adapters — `src/llama_video/adapters/`
+
+The adapter system provides a per-model-family interface for the full preprocessing-to-response pipeline:
+
+- `ModelAdapter` (abstract base) — defines `preprocess()`, `build_payload()`, `parse_response()`, `estimate_tokens()`, and adapter metadata (name, max duration, etc.).
+- `AdapterPreset` — dataclass carrying sampler parameters (temperature, top_p, top_k, min_p, presence_penalty).
+- `register_adapter(name, cls)` / `get_adapter(name)` — registry with case-insensitive lookup.
+- `detect_adapter(server_url)` — auto-detects model family from llama-server's `/v1/models` endpoint.
+
+**Implemented adapters:**
+
+| Adapter | Preprocessing | Payload | Response parsing | C patch |
+|---------|--------------|---------|-----------------|---------|
+| Qwen3.5 | Super-frame pairing, grid THW, temporal M-RoPE | `image_url` per frame + `mm_processor_kwargs` | Extract `<think >` tags from content | Required |
+| Gemma4 | Frames as individual images with integer timestamps | Standard `image_url` per frame | Content is the caption; reasoning from `CompletionResult.reasoning` | Not needed |
+
+Adding a new model family means subclassing `ModelAdapter`, calling `register_adapter()` at module level, and importing the module in `adapters/__init__.py`.
 
 ---
 
@@ -184,10 +203,13 @@ Every Python exception class carries a `context: dict` for diagnostics. The `/v1
 
 ### Other model families
 
-The architecture supports any GGUF + mmproj model with a temporal dimension in its vision encoder. The work per family:
+The `ModelAdapter` architecture supports any GGUF + mmproj model with multimodal capabilities. The work per family:
 
-1. A new `ModelConfig` profile (pixel bounds, patch sizes, normalization constants).
-2. If the encoder differs from Qwen3.5's Conv3D decomposition, a new file under `tools/mtmd/models/` and a corresponding patch hunk.
+1. A new `ModelAdapter` subclass (preprocessing, payload shape, response parsing, token estimation).
+2. Register it via `register_adapter()` in the adapters package.
+3. If the encoder requires special C support (like Qwen3.5's Conv3D decomposition), a new file under `tools/mtmd/models/` and a corresponding patch hunk. Models using stock llama.cpp (like Gemma4) skip this step entirely.
+
+Currently implemented: Qwen3.5 (patched) and Gemma4 (stock llama.cpp).
 
 ### Audio + video
 
